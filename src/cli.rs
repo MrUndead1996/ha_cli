@@ -9,7 +9,11 @@ use clap::{Parser, Subcommand};
 use serde_json::{Map, Value as Json};
 
 #[derive(Parser)]
-#[command(name = "ha", about = "Home Assistant Intent CLI for AI agents")]
+#[command(
+    name = "ha",
+    version,
+    about = "Home Assistant Intent CLI for AI agents"
+)]
 pub struct Cli {
     /// Print debug trace to stderr on unexpected errors
     #[arg(long)]
