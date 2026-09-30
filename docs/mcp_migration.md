@@ -249,6 +249,33 @@ JSON-литерал, дробные отклоняются). Если `domain` �
   трактовать как доказательство, что действие не выполнено: автоматический
   повтор вызова может выполнить его дважды.
 
+Реализовано (этап 4.3, подпункт 3 — аудит и закрытие пробелов). Запрет
+административных/конфигурационных инструментов через `intent` подтверждён
+аудитом маршрута `CLI -> intents::execute -> resolver::prepare_action ->
+tools_call`: имена инструментов — константы кода (`HA_GET_STATE_TOOL`,
+`HA_CALL_SERVICE_TOOL`), домен и сервис выбирает только CLI по интенту
+(`TURN_SERVICE_DOMAINS`, фиксированные `light.turn_on` /
+`cover.set_cover_position`), `data` собирается только из полей, прошедших
+`validate_intent_payload` (allowlist ключей без `data` / `service` / `tool` /
+`wait` и с рекурсивным запретом `entity_id`), CLI-команда `tools` — только
+диагностика, raw `tools/call` через CLI отсутствует.
+
+Неопределённый исход записи: на ha-mcp-пути вызов `ha_call_service` никогда
+не повторяется автоматически. Проверены обе формы stale tool name: MCP
+`isError` с текстом «Tool … not found» и JSON-RPC `error` (например,
+`-32602 unknown tool`) — обе завершаются ошибкой `intent_failed` без
+повторного вызова и с пометкой «may still have been performed».
+Формулировка ошибки транспорта нейтральна к факту отправки: при
+DNS-fail/отказе соединения запрос мог не покинуть клиента, а при JSON-RPC
+error — дойти, но не выполниться; клиент не может это различить, поэтому
+текст не утверждает «sent» (только «whether the request reached the server
+is unknown … not repeated automatically»). Discovery сбоит до первого
+вызова записи (поиск инструмента выполняется один раз до цикла целей), а
+частичный успех по целям не откатывается и не дозаказывается; сообщение
+называет число выполненных целей и вычищает внутренние ID. Read-only
+stale-refresh разрешён только `HassGetState` / `context`. Assist-путь без
+`mcp_url` не изменён.
+
 Реализовано (этап 4.2): действия `HassTurnOn` / `HassTurnOff` /
 `HassLightSet` / `HassSetPosition` на ha-mcp (`mcp_url` задан) исполняются
 через `ha_call_service` (`src/intents.rs`, `execute_hamcp_action`). Полный

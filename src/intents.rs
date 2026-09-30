@@ -318,14 +318,20 @@ fn execute_hamcp_action(
                 }
             }
             Err(err) => {
-                // Ошибка транспорта/сервера после отправки вызова:
-                // повтор запрещён, факт выполнения неизвестен.
+                // Ошибка транспорта/сервера на вызове записи: повтор
+                // запрещён, факт выполнения неизвестен. Текст НЕ
+                // утверждает, что запрос был отправлен: при DNS-fail или
+                // отказе соединения запрос мог не покинуть клиента, а
+                // JSON-RPC error (например, «unknown tool») означает, что
+                // запрос дошёл, но сервис не выполнялся — клиент не может
+                // это различить, поэтому формулировка нейтральна.
                 return Err(action_error(
                     performed,
                     entities.len(),
                     &format!(
-                        "{}; the call was sent once and was not repeated, so the \
-                         action may still have been performed",
+                        "{}; whether the request reached the server is unknown, \
+                         the action may still have been performed, and the call \
+                         was not repeated automatically",
                         err.message
                     ),
                     &entities,
@@ -1547,6 +1553,145 @@ mod tests {
         assert!(err.message.contains("not repeated"));
         // Вызов был отправлен один раз и не повторялся.
         assert_eq!(mock.call_count(), 1);
+    }
+
+    #[test]
+    fn transport_error_text_does_not_claim_the_request_was_sent() {
+        // Ошибка до отправки (DNS/connect fail): клиент не может знать,
+        // покинул ли запрос машину, поэтому текст ошибки не утверждает
+        // «sent» ни в какой форме — но повтор по-прежнему не выполняется,
+        // а неопределённость исхода сохраняется.
+        struct ConnectFailOnWrite(std::rc::Rc<MockAction>);
+        impl Transport for ConnectFailOnWrite {
+            fn post(
+                &mut self,
+                _url: &str,
+                payload: &Json,
+                _headers: &[(String, String)],
+            ) -> Result<HttpResponse, HaCliError> {
+                if payload.get("method").and_then(Json::as_str) == Some("tools/call")
+                    && payload.pointer("/params/name").and_then(Json::as_str)
+                        == Some("ha_call_service")
+                {
+                    self.0
+                        .calls
+                        .borrow_mut()
+                        .push(payload["params"]["arguments"].clone());
+                    return Err(HaCliError::new(
+                        ErrorType::Connection,
+                        "Unable to connect to Home Assistant",
+                    ));
+                }
+                self.0.post(payload)
+            }
+        }
+        let mock = std::rc::Rc::new(MockAction::new());
+        let config = Config {
+            url: Some("http://ha.local".to_string()),
+            mcp_url: Some("http://ha.local/api/webhook/test".to_string()),
+            mcp_auth: McpAuth::None,
+            token: String::new(),
+            timeout: 5,
+            connect_timeout: 5,
+        };
+        let mut client = Client::new(
+            config,
+            Box::new(ConnectFailOnWrite(mock.clone())),
+            &Secrets::new(),
+        );
+        let err = execute(&mut client, "HassTurnOn", &json!({"name": "One"})).unwrap_err();
+        assert!(matches!(err.kind, ErrorType::Intent));
+        let lowered = err.message.to_lowercase();
+        assert!(!lowered.contains("sent"), "{err}");
+        assert!(
+            err.message.contains("may still have been performed"),
+            "{err}"
+        );
+        assert!(err.message.contains("not repeated"), "{err}");
+    }
+
+    #[test]
+    fn stale_tool_name_as_jsonrpc_error_is_not_retried() {
+        // Тот же stale-случай, но сервер отвечает JSON-RPC error
+        // («unknown tool») вместо MCP isError: повтор так же запрещён,
+        // исход помечен как неизвестный.
+        struct RpcErrorMock(std::rc::Rc<MockAction>);
+        impl Transport for RpcErrorMock {
+            fn post(
+                &mut self,
+                _url: &str,
+                payload: &Json,
+                _headers: &[(String, String)],
+            ) -> Result<HttpResponse, HaCliError> {
+                if payload.get("method").and_then(Json::as_str) == Some("tools/call")
+                    && payload.pointer("/params/name").and_then(Json::as_str)
+                        == Some("ha_call_service")
+                {
+                    self.0
+                        .calls
+                        .borrow_mut()
+                        .push(payload["params"]["arguments"].clone());
+                    let id = payload.get("id").and_then(Json::as_u64).unwrap_or(0);
+                    return Ok(HttpResponse {
+                        status: 200,
+                        headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                        body: json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32602,
+                                "message": "Tool ha_call_service not found",
+                            },
+                        })
+                        .to_string(),
+                    });
+                }
+                self.0.post(payload)
+            }
+        }
+        let mock = std::rc::Rc::new(MockAction::new());
+        let config = Config {
+            url: Some("http://ha.local".to_string()),
+            mcp_url: Some("http://ha.local/api/webhook/test".to_string()),
+            mcp_auth: McpAuth::None,
+            token: String::new(),
+            timeout: 5,
+            connect_timeout: 5,
+        };
+        let mut client = Client::new(
+            config,
+            Box::new(RpcErrorMock(mock.clone())),
+            &Secrets::new(),
+        );
+        let err = execute(&mut client, "HassTurnOn", &json!({"name": "One"})).unwrap_err();
+        assert!(matches!(err.kind, ErrorType::Intent), "{err}");
+        assert!(
+            err.message.contains("may still have been performed"),
+            "{err}"
+        );
+        assert!(err.message.contains("not repeated"), "{err}");
+        assert_eq!(mock.call_count(), 1, "no second write after JSON-RPC error");
+    }
+
+    #[test]
+    fn payload_cannot_select_tool_service_or_admin_data() {
+        // Пользовательский payload не может выбрать инструмент,
+        // сервис или вложенные admin-данные: ключи вне allowlist
+        // отклоняются ДО любых сетевых вызовов (NoNetwork паникует).
+        let mut client = mcp_client();
+        for payload in [
+            json!({"area": "kitchen", "service": "restart"}),
+            json!({"area": "kitchen", "tool": "ha_call_service"}),
+            json!({"area": "kitchen", "domain": "light", "service": "turn_on"}),
+            json!({"area": "kitchen", "data": {"admin": true}}),
+            json!({"area": "kitchen", "name": "One", "wait": true}),
+        ] {
+            let err = execute(&mut client, "HassTurnOn", &payload).unwrap_err();
+            assert!(
+                matches!(err.kind, ErrorType::InvalidArguments),
+                "{payload}: {err}"
+            );
+        }
     }
 
     #[test]
