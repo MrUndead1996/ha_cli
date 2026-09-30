@@ -2,6 +2,7 @@ use ha_cli::client::{Client, HttpResponse, Transport};
 use ha_cli::config::Config;
 use ha_cli::context;
 use ha_cli::errors::{ErrorType, HaCliError};
+use ha_cli::models::Entity;
 use ha_cli::security::Secrets;
 use serde_json::{json, Value as Json};
 use std::collections::VecDeque;
@@ -153,6 +154,553 @@ fn make_client(transport: &MockTransport) -> Client {
         connect_timeout: 5,
     };
     Client::new(config, Box::new(transport.clone()), &secrets)
+}
+
+/// Клиент с настроенным `mcp_url`: путь ha-mcp (ha_search вместо
+/// GetLiveContext).
+fn make_mcp_client(transport: &MockTransport) -> Client {
+    let secrets = Secrets::new();
+    let config = Config {
+        url: None,
+        mcp_url: Some("http://ha.test/api/webhook/testsecret123".to_string()),
+        mcp_auth: Default::default(),
+        token: String::new(),
+        timeout: 5,
+        connect_timeout: 5,
+    };
+    Client::new(config, Box::new(transport.clone()), &secrets)
+}
+
+// ---------- ha_search (этап 3.1: семантическое разрешение, ha-mcp) ----------
+
+fn search_page(entities: Json, total: i64, has_more: bool, next_offset: Json) -> Json {
+    json!({
+        "success": true,
+        "entities": entities,
+        "entity_total_matches": total,
+        "entity_has_more": has_more,
+        "entity_next_offset": next_offset,
+        "partial": false,
+        "errors": [],
+        "warnings": [],
+        "offset": 0,
+        "limit": 1,
+    })
+}
+
+fn entity(id: &str, name: &str, area: &str) -> Json {
+    json!({
+        "entity_id": id,
+        "friendly_name": name,
+        "domain": id.split('.').next().unwrap_or("unknown"),
+        "state": "on",
+        "area": area,
+        "aliases": [],
+    })
+}
+
+/// Обзор с доменами; домены перебираются в отсортированном порядке.
+fn domain_stats(stats: Json) -> Json {
+    json!({"success": true, "domain_stats": stats, "entities": [{"entity_id": "overview.leak"}]})
+}
+
+fn ha_search_transport(overview: Json) -> MockTransport {
+    let transport = MockTransport::new(vec![
+        json!({"name": "ha_search"}),
+        json!({"name": "ha_get_overview"}),
+    ]);
+    // Первый tools/call — ha_get_overview(fields=["domain_stats"]).
+    transport.push_call_result(200, json!({"structuredContent": overview}));
+    transport
+}
+
+#[test]
+fn ha_search_aggregates_all_domains_with_per_domain_offsets() {
+    let _cache = isolated_cache();
+    let transport = ha_search_transport(domain_stats(json!({
+        "sensor": 1,
+        "light": 2,
+    })));
+    // Домены в отсортированном порядке: light (2 страницы), sensor (1).
+    transport.push_call_result(
+        200,
+        json!({
+            "structuredContent": search_page(
+                json!([entity("light.a", "A", "Bathroom")]),
+                2,
+                true,
+                json!(1),
+            ),
+        }),
+    );
+    transport.push_call_result(
+        200,
+        json!({
+            "structuredContent": search_page(
+                json!([entity("light.b", "B", "")]),
+                2,
+                false,
+                Json::Null,
+            ),
+        }),
+    );
+    transport.push_call_result(
+        200,
+        json!({
+            "structuredContent": search_page(
+                json!([entity("sensor.c", "C", "Bathroom")]),
+                1,
+                false,
+                Json::Null,
+            ),
+        }),
+    );
+    let mut client = make_mcp_client(&transport);
+
+    let live = context::get_live_context(&mut client).unwrap();
+
+    assert_eq!(live["entities"].as_array().unwrap().len(), 3);
+    assert_eq!(live["entity_total_matches"], json!(3));
+    assert_eq!(live["partial"], json!(false));
+    assert_eq!(live["source"], json!("ha_search"));
+    assert_eq!(live["domains"], json!(2));
+    // Сущность из обзора не протекает в каталог.
+    assert!(live["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|e| e["entity_id"] != json!("overview.leak")));
+    let calls = transport.tool_calls();
+    let (overview_calls, search_calls): (Vec<_>, Vec<_>) = calls
+        .iter()
+        .cloned()
+        .partition(|(name, _)| name == "ha_get_overview");
+    // Обзор запрошен ровно один раз с проекцией domain_stats.
+    assert_eq!(overview_calls.len(), 1);
+    assert_eq!(overview_calls[0].1["fields"], json!(["domain_stats"]));
+    // Каждый ha_search — только с непустым domain_filter, limit и
+    // result_fields; offset сбрасывается на каждом домене.
+    assert_eq!(search_calls.len(), 3);
+    assert!(search_calls.iter().all(|(_, args)| {
+        args["domain_filter"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty())
+            && args["limit"] == json!(context::HA_SEARCH_PAGE_LIMIT)
+            && args["result_fields"].is_array()
+    }));
+    let sequence: Vec<(String, i64)> = search_calls
+        .iter()
+        .map(|(_, args)| {
+            (
+                args["domain_filter"].as_str().unwrap().to_string(),
+                args["offset"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        sequence,
+        vec![
+            ("light".to_string(), 0),
+            ("light".to_string(), 1),
+            ("sensor".to_string(), 0),
+        ]
+    );
+}
+
+#[test]
+fn ha_search_accepts_overview_and_pages_as_json_text() {
+    let _cache = isolated_cache();
+    let transport = ha_search_transport(domain_stats(json!({"light": 1})));
+    let page = search_page(
+        json!([entity("light.a", "A", "Kitchen")]),
+        1,
+        false,
+        Json::Null,
+    );
+    transport.push_call_result(
+        200,
+        json!({"content": [{"type": "text", "text": page.to_string()}]}),
+    );
+    let mut client = make_mcp_client(&transport);
+
+    let live = context::get_live_context(&mut client).unwrap();
+
+    assert_eq!(live["entities"].as_array().unwrap().len(), 1);
+    assert_eq!(live["entities"][0]["entity_id"], json!("light.a"));
+}
+
+#[test]
+fn ha_search_context_and_compact_use_friendly_names() {
+    let _cache = isolated_cache();
+    let transport = ha_search_transport(domain_stats(json!({"light": 2})));
+    transport.push_call_result(
+        200,
+        json!({
+            "structuredContent": search_page(
+                json!([
+                    entity("light.main", "Main Light", "Bathroom"),
+                    {"entity_id": "light.alt", "friendly_name": "Alt", "domain": "light", "state": "off", "area": "Bathroom", "aliases": ["Sanuzel"]},
+                ]),
+                2,
+                false,
+                Json::Null,
+            ),
+        }),
+    );
+    let mut client = make_mcp_client(&transport);
+
+    let live = context::get_live_context(&mut client).unwrap();
+    let built = context::build_context(&live);
+
+    assert_eq!(
+        built,
+        json!({
+            "areas": {"Bathroom": {"light": ["Alt", "Main Light"]}},
+        })
+    );
+}
+
+#[test]
+fn ha_search_deduplicates_entity_ids_across_pages() {
+    let _cache = isolated_cache();
+    let transport = ha_search_transport(domain_stats(json!({"light": 2})));
+    transport.push_call_result(
+        200,
+        json!({
+            "structuredContent": search_page(
+                json!([entity("light.a", "A", "X")]),
+                2,
+                true,
+                json!(1),
+            ),
+        }),
+    );
+    transport.push_call_result(
+        200,
+        json!({
+            "structuredContent": search_page(
+                json!([entity("light.a", "A", "X"), entity("light.b", "B", "X")]),
+                2,
+                false,
+                Json::Null,
+            ),
+        }),
+    );
+    let mut client = make_mcp_client(&transport);
+
+    let live = context::get_live_context(&mut client).unwrap();
+
+    let ids: Vec<&str> = live["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["entity_id"].as_str())
+        .collect();
+    assert_eq!(ids, vec!["light.a", "light.b"]);
+}
+
+#[test]
+fn ha_search_domain_stats_as_object_map_is_supported() {
+    let _cache = isolated_cache();
+    let transport = ha_search_transport(domain_stats(json!({"light": 1})));
+    transport.push_call_result(
+        200,
+        json!({
+            "structuredContent": search_page(
+                json!([entity("light.a", "A", "X")]),
+                1,
+                false,
+                Json::Null,
+            ),
+        }),
+    );
+    let mut client = make_mcp_client(&transport);
+    assert!(context::get_live_context(&mut client).is_ok());
+}
+
+#[test]
+fn ha_search_domain_stats_as_array_of_objects_is_supported() {
+    let _cache = isolated_cache();
+    let transport = ha_search_transport(domain_stats(json!([
+        {"domain": "light", "count": 1},
+    ])));
+    transport.push_call_result(
+        200,
+        json!({
+            "structuredContent": search_page(
+                json!([entity("light.a", "A", "X")]),
+                1,
+                false,
+                Json::Null,
+            ),
+        }),
+    );
+    let mut client = make_mcp_client(&transport);
+    assert!(context::get_live_context(&mut client).is_ok());
+}
+
+#[test]
+fn ha_search_domain_stats_nested_under_overview_key_is_supported() {
+    let _cache = isolated_cache();
+    let transport = ha_search_transport(json!({
+        "success": true,
+        "overview": {"domain_stats": {"light": 1}},
+    }));
+    transport.push_call_result(
+        200,
+        json!({
+            "structuredContent": search_page(
+                json!([entity("light.a", "A", "X")]),
+                1,
+                false,
+                Json::Null,
+            ),
+        }),
+    );
+    let mut client = make_mcp_client(&transport);
+    assert!(context::get_live_context(&mut client).is_ok());
+}
+
+#[test]
+fn ha_search_partial_result_is_rejected() {
+    let _cache = isolated_cache();
+    let transport = ha_search_transport(domain_stats(json!({"light": 1})));
+    let page = search_page(json!([entity("light.a", "A", "X")]), 1, false, Json::Null)
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                if k == "partial" {
+                    json!(true)
+                } else {
+                    v.clone()
+                },
+            )
+        })
+        .collect::<Json>();
+    transport.push_call_result(200, json!({"structuredContent": page}));
+    let mut client = make_mcp_client(&transport);
+
+    let err = context::get_live_context(&mut client).unwrap_err();
+
+    assert!(matches!(err.kind, ErrorType::Context));
+    assert!(err.message.contains("partial"));
+}
+
+#[test]
+fn ha_search_errors_field_is_rejected() {
+    let _cache = isolated_cache();
+    let transport = ha_search_transport(domain_stats(json!({"light": 1})));
+    let mut page = search_page(json!([]), 0, false, Json::Null);
+    page["errors"] = json!(["internal failure"]);
+    transport.push_call_result(200, json!({"structuredContent": page}));
+    let mut client = make_mcp_client(&transport);
+
+    let err = context::get_live_context(&mut client).unwrap_err();
+
+    assert!(matches!(err.kind, ErrorType::Context));
+    assert!(err.message.contains("incomplete"));
+    // Детали ошибок сервера не выводятся.
+    assert!(!err.message.contains("internal failure"));
+}
+
+#[test]
+fn ha_search_has_more_without_next_offset_is_rejected() {
+    let _cache = isolated_cache();
+    let transport = ha_search_transport(domain_stats(json!({"light": 3})));
+    transport.push_call_result(
+        200,
+        json!({
+            "structuredContent": search_page(
+                json!([entity("light.a", "A", "X")]),
+                3,
+                true,
+                Json::Null,
+            ),
+        }),
+    );
+    let mut client = make_mcp_client(&transport);
+
+    let err = context::get_live_context(&mut client).unwrap_err();
+
+    assert!(matches!(err.kind, ErrorType::Context));
+    assert!(err.message.contains("entity_next_offset"));
+}
+
+#[test]
+fn ha_search_collected_entities_missing_total_is_rejected() {
+    let _cache = isolated_cache();
+    let transport = ha_search_transport(domain_stats(json!({"light": 5})));
+    transport.push_call_result(
+        200,
+        json!({
+            "structuredContent": search_page(
+                json!([entity("light.a", "A", "X")]),
+                5,
+                false,
+                Json::Null,
+            ),
+        }),
+    );
+    let mut client = make_mcp_client(&transport);
+
+    let err = context::get_live_context(&mut client).unwrap_err();
+
+    assert!(matches!(err.kind, ErrorType::Context));
+    assert!(err.message.contains("1 of 5"));
+}
+
+#[test]
+fn ha_search_tool_is_error_is_rejected() {
+    let _cache = isolated_cache();
+    let transport = ha_search_transport(domain_stats(json!({"light": 1})));
+    transport.push_call_result(
+        200,
+        json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "ha_search failed"}],
+        }),
+    );
+    let mut client = make_mcp_client(&transport);
+
+    let err = context::get_live_context(&mut client).unwrap_err();
+
+    assert!(matches!(err.kind, ErrorType::Context));
+    assert!(err.message.contains("ha_search failed"));
+}
+
+#[test]
+fn ha_search_success_false_is_rejected() {
+    let _cache = isolated_cache();
+    let transport = ha_search_transport(domain_stats(json!({"light": 1})));
+    transport.push_call_result(
+        200,
+        json!({
+            "structuredContent": {"success": false, "error": "search unavailable"},
+        }),
+    );
+    let mut client = make_mcp_client(&transport);
+
+    let err = context::get_live_context(&mut client).unwrap_err();
+
+    assert!(matches!(err.kind, ErrorType::Context));
+    assert!(err.message.contains("search unavailable"));
+}
+
+#[test]
+fn ha_search_overview_is_error_is_rejected() {
+    let _cache = isolated_cache();
+    let transport = MockTransport::new(vec![
+        json!({"name": "ha_search"}),
+        json!({"name": "ha_get_overview"}),
+    ]);
+    transport.push_call_result(
+        200,
+        json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "overview unavailable"}],
+        }),
+    );
+    let mut client = make_mcp_client(&transport);
+
+    let err = context::get_live_context(&mut client).unwrap_err();
+
+    assert!(matches!(err.kind, ErrorType::Context));
+    assert!(err.message.contains("overview unavailable"));
+}
+
+#[test]
+fn ha_search_missing_domain_stats_is_rejected() {
+    let _cache = isolated_cache();
+    let transport = ha_search_transport(json!({"success": true}));
+    let mut client = make_mcp_client(&transport);
+
+    let err = context::get_live_context(&mut client).unwrap_err();
+
+    assert!(matches!(err.kind, ErrorType::Context));
+    assert!(err.message.contains("domain_stats"));
+}
+
+#[test]
+fn ha_search_empty_domain_stats_is_rejected() {
+    let _cache = isolated_cache();
+    let transport = ha_search_transport(domain_stats(json!({})));
+    let mut client = make_mcp_client(&transport);
+
+    let err = context::get_live_context(&mut client).unwrap_err();
+
+    assert!(matches!(err.kind, ErrorType::Context));
+    assert!(err.message.contains("empty domain_stats"));
+}
+
+#[test]
+fn ha_search_raw_returns_aggregated_catalog() {
+    let _cache = isolated_cache();
+    let transport = ha_search_transport(domain_stats(json!({"light": 1})));
+    transport.push_call_result(
+        200,
+        json!({
+            "structuredContent": search_page(
+                json!([entity("light.a", "A", "X")]),
+                1,
+                false,
+                Json::Null,
+            ),
+        }),
+    );
+    let mut client = make_mcp_client(&transport);
+
+    let raw = context::get_raw_result(&mut client).unwrap();
+
+    assert_eq!(raw["entities"].as_array().unwrap().len(), 1);
+    assert_eq!(raw["partial"], json!(false));
+}
+
+#[test]
+fn ha_search_missing_tool_is_not_found_error() {
+    let _cache = isolated_cache();
+    let transport = MockTransport::new(vec![json!({"name": "other_tool"})]);
+    let mut client = make_mcp_client(&transport);
+
+    let err = context::get_live_context(&mut client).unwrap_err();
+
+    assert!(matches!(err.kind, ErrorType::ToolNotFound));
+}
+
+#[test]
+fn entity_from_raw_supports_ha_search_and_assist_shapes() {
+    let ha = Entity::from_raw(&json!({
+        "entity_id": "light.a",
+        "friendly_name": "A",
+        "domain": "light",
+        "state": "on",
+        "area": "Bathroom",
+        "aliases": ["Sanuzel", "Bathroom"],
+    }))
+    .unwrap();
+    assert_eq!(ha.name, "A");
+    assert_eq!(ha.area, "Bathroom");
+    assert_eq!(ha.aliases, Vec::<String>::new());
+    // Алиасы сущности сохраняются целиком (в т.ч. совпадающие с областью):
+    // это алиасы сущности, а не области.
+    assert_eq!(
+        ha.entity_aliases,
+        vec!["Sanuzel".to_string(), "Bathroom".to_string()]
+    );
+    assert_eq!(ha.entity_id.as_deref(), Some("light.a"));
+
+    let assist = Entity::from_raw(&json!({
+        "name": "B",
+        "domain": "switch",
+        "area": "Kitchen,Cooking",
+    }))
+    .unwrap();
+    assert_eq!(assist.area, "Kitchen");
+    assert_eq!(assist.aliases, vec!["Cooking".to_string()]);
+    assert_eq!(assist.entity_id, None);
+    assert!(Entity::from_raw(&json!({"friendly_name": ""})).is_none());
 }
 
 // ---------- get_live_context / refresh ----------

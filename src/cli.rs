@@ -22,6 +22,12 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Print live Assist context
+    ///
+    /// `--raw`: без `mcp_url` — сырой результат `GetLiveContext` (Assist);
+    /// с настроенным `mcp_url` (ha-mcp) — агрегированный ответ `ha_search`
+    /// по всем страницам (`entities`, `entity_total_matches`, `partial`,
+    /// `errors`, `source`, `pages`). URL с секретом и токен в вывод и логи
+    /// не попадают: секреты редактируются перед печатью.
     Context {
         #[arg(long)]
         raw: bool,

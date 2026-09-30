@@ -118,6 +118,29 @@ URL, часть path, секретный сегмент и токен редак
 
 ### 3. Семантическое разрешение (`src/context.rs`, `src/models.rs`)
 
+Реализовано (этап 3.1): `GetLiveContext` заменён на `ha_search` только при
+настроенном `mcp_url` (ha-mcp 8.6.0); Assist-путь без `mcp_url` и его тесты
+сохранены. Полный каталог строится как: `ha_get_overview(fields=["domain_stats"])`
+(только имена доменов, сущности из обзора не берутся) → постраничный
+`ha_search(domain_filter=…, limit<=200, offset…, result_fields…)` для каждого
+домена; пагинация следует `entity_has_more` / `entity_next_offset`, ID
+дедуплицируются, сумма `entity_total_matches` по доменам сверяется с числом
+собранных сущностей.
+При `partial=true`, непустом `errors`, `entity_has_more=true` без валидного
+`entity_next_offset` или несовпадении числа собранных сущностей с
+`entity_total_matches` выдаётся `context_error` (exit 10), неполный каталог
+не выдаётся никогда. `Entity` (`src/models.rs`) принимает оба формата:
+ha-mcp (`friendly_name`, `entity_id`, массив `aliases` алиасов СУЩНОСТИ) и
+прежний Assist
+(`name`, область с алиасами ОБЛАСТИ через запятую). Алиасы сущности хранятся
+в `Entity.entity_aliases` отдельно и не попадают в `area_aliases` и
+сопоставление области; `area_aliases` для ha-mcp на этом этапе пусты — если
+потребуются алиасы областей, их берут отдельным вызовом `ha_list_floors_areas`
+только после анализа его схемы и источника данных. `context` / `context --compact`
+работают на агрегированном ответе; `context --raw` с `mcp_url` выводит
+агрегированный ответ `ha_search` (новый формат вместо ответа
+`GetLiveContext`); секреты (webhook URL, токен) в вывод и логи не попадают.
+
 - Заменить `GetLiveContext` на `ha_search` с фильтрами и явной обработкой
   `limit` / `offset` / `has_more`. Для построения контекста получить все
   страницы; при `partial`, ошибке или недоступной странице не выдавать
