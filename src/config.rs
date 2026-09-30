@@ -19,7 +19,11 @@ pub struct Config {
     /// получает Bearer как раньше.
     pub mcp_auth: McpAuth,
     pub token: String,
+    /// Общий таймаут исполнения запроса (сек): сервисы ha-mcp могут ждать
+    /// подтверждения изменения состояния, поэтому настраивается отдельно.
     pub timeout: u64,
+    /// Таймаут установки TCP/TLS-соединения (сек), отдельно от `timeout`.
+    pub connect_timeout: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,6 +51,10 @@ impl McpAuth {
 }
 
 pub const DEFAULT_TIMEOUT: u64 = 5;
+/// Повышенный default таймаут исполнения для ha-mcp: сервисы могут ждать
+/// подтверждения изменения состояния (`wait=true` — десятки секунд).
+pub const DEFAULT_MCP_TIMEOUT: u64 = 60;
+pub const DEFAULT_CONNECT_TIMEOUT: u64 = 5;
 const DEFAULT_CONFIG_PATH: &str = "~/.config/ha-cli/config.toml";
 
 /// Перенос `load_config(config_path=DEFAULT_CONFIG_PATH, ...)`.
@@ -178,10 +186,20 @@ pub fn load_config_from(
         secrets.register(t);
     }
 
+    // Явный TOML `timeout` имеет приоритет; иначе Assist — 5 c, ha-mcp — 60 c.
     let timeout = data
         .get("timeout")
         .and_then(Json::as_u64)
-        .unwrap_or(DEFAULT_TIMEOUT);
+        .unwrap_or(if mcp_url.is_some() {
+            DEFAULT_MCP_TIMEOUT
+        } else {
+            DEFAULT_TIMEOUT
+        });
+    let connect_timeout = std::env::var("HA_CONNECT_TIMEOUT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .or_else(|| data.get("connect_timeout").and_then(Json::as_u64))
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT);
 
     Ok(Config {
         url,
@@ -189,6 +207,7 @@ pub fn load_config_from(
         mcp_auth,
         token: token.unwrap_or_default(),
         timeout,
+        connect_timeout,
     })
 }
 
@@ -278,6 +297,7 @@ mod tests {
         "HA_TOKEN_FILE",
         "HA_MCP_URL",
         "HA_MCP_AUTH",
+        "HA_CONNECT_TIMEOUT",
     ];
 
     /// Под одним мьютексом сохраняет предыдущие значения ключей и
@@ -334,6 +354,74 @@ mod tests {
 
     fn mcp_url() -> &'static str {
         "http://ha.local/api/webhook/testsecret123"
+    }
+
+    #[test]
+    fn timeout_defaults_are_preserved_for_assist() {
+        let _guard = EnvGuard::new();
+        let config = load_config_from(
+            "/nonexistent/config.toml",
+            Some("http://ha.local"),
+            Some("tok"),
+            &mut Secrets::new(),
+        )
+        .unwrap();
+        assert_eq!(config.timeout, DEFAULT_TIMEOUT);
+        assert_eq!(config.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
+    }
+
+    #[test]
+    fn connect_timeout_from_env_and_toml() {
+        let guard = EnvGuard::new();
+        guard.set("HA_CONNECT_TIMEOUT", "3");
+        let (_dir, path) = write_config("timeout = 90\nconnect_timeout = 7\n");
+        let config = load_config_from(
+            &path,
+            Some("http://ha.local"),
+            Some("tok"),
+            &mut Secrets::new(),
+        )
+        .unwrap();
+        assert_eq!(config.timeout, 90);
+        assert_eq!(config.connect_timeout, 3);
+    }
+
+    #[test]
+    fn toml_connect_timeout_without_env() {
+        let _guard = EnvGuard::new();
+        let (_dir, path) = write_config("connect_timeout = 7\n");
+        let config = load_config_from(
+            &path,
+            Some("http://ha.local"),
+            Some("tok"),
+            &mut Secrets::new(),
+        )
+        .unwrap();
+        assert_eq!(config.connect_timeout, 7);
+    }
+
+    #[test]
+    fn mcp_only_default_timeout_is_elevated() {
+        let guard = EnvGuard::new();
+        guard.set("HA_MCP_URL", mcp_url());
+        let config = load_config_from(
+            "/nonexistent/config.toml",
+            None,
+            Some("tok"),
+            &mut Secrets::new(),
+        )
+        .unwrap();
+        assert_eq!(config.timeout, DEFAULT_MCP_TIMEOUT);
+        assert_eq!(config.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
+    }
+
+    #[test]
+    fn explicit_timeout_wins_over_mcp_default() {
+        let guard = EnvGuard::new();
+        guard.set("HA_MCP_URL", mcp_url());
+        let (_dir, path) = write_config("timeout = 9\n");
+        let config = load_config_from(&path, None, Some("tok"), &mut Secrets::new()).unwrap();
+        assert_eq!(config.timeout, 9);
     }
 
     #[test]

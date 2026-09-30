@@ -96,6 +96,7 @@ fn make_client(transport: MockTransport) -> Client {
             mcp_auth: Default::default(),
             token: "secret".to_string(),
             timeout: 5,
+            connect_timeout: 5,
         },
     )
 }
@@ -222,6 +223,7 @@ fn connection_error_from_transport() {
             mcp_auth: Default::default(),
             token: "secret".to_string(),
             timeout: 5,
+            connect_timeout: 5,
         },
         Box::new(Failing),
         &secrets,
@@ -404,6 +406,7 @@ fn mcp_url_used_as_is_webhook() {
             mcp_auth: Default::default(),
             token: String::new(),
             timeout: 5,
+            connect_timeout: 5,
         },
     );
     client.notify("notifications/initialized", None).unwrap();
@@ -428,6 +431,7 @@ fn mcp_url_used_as_is_direct_private_path() {
             mcp_auth: Default::default(),
             token: String::new(),
             timeout: 5,
+            connect_timeout: 5,
         },
     );
     client.notify("notifications/initialized", None).unwrap();
@@ -461,6 +465,7 @@ fn secret_mcp_url_redacted_in_transport_error() {
             mcp_auth: Default::default(),
             token: String::new(),
             timeout: 5,
+            connect_timeout: 5,
         },
         Box::new(Failing),
         &secrets,
@@ -478,6 +483,7 @@ fn auth_header_only_for_assist_endpoint() {
         mcp_auth: Default::default(),
         token: "ha-token".to_string(),
         timeout: 5,
+        connect_timeout: 5,
     };
     assert_eq!(auth_header(&assist), Some("Bearer ha-token".to_string()));
     assert_eq!(
@@ -490,6 +496,7 @@ fn auth_header_only_for_assist_endpoint() {
         mcp_auth: Default::default(),
         token: "ha-token".to_string(),
         timeout: 5,
+        connect_timeout: 5,
     };
     assert_eq!(auth_header(&webhook), None);
     assert_eq!(
@@ -506,6 +513,7 @@ fn auth_header_ha_auth_opt_in_sends_token_to_mcp_url() {
         mcp_auth: ha_cli::config::McpAuth::HaAuth,
         token: "ha-token".to_string(),
         timeout: 5,
+        connect_timeout: 5,
     };
     assert_eq!(auth_header(&webhook), Some("Bearer ha-token".to_string()));
 }

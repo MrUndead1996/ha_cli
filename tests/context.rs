@@ -150,6 +150,7 @@ fn make_client(transport: &MockTransport) -> Client {
         mcp_auth: Default::default(),
         token: String::new(),
         timeout: 5,
+        connect_timeout: 5,
     };
     Client::new(config, Box::new(transport.clone()), &secrets)
 }

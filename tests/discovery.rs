@@ -89,6 +89,7 @@ fn fake_client(responses: Vec<Json>) -> (Client, MockTransport) {
         mcp_auth: Default::default(),
         token: String::new(),
         timeout: 5,
+        connect_timeout: 5,
     };
     let client = Client::new(config, Box::new(transport.clone()), &secrets);
     (client, transport)

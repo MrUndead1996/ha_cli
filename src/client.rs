@@ -117,16 +117,39 @@ impl Client {
         Ok(response)
     }
 
-    fn parse_body(&self, response: &HttpResponse) -> Result<Json, HaCliError> {
+    fn parse_body(&self, response: &HttpResponse, expected_id: u64) -> Result<Json, HaCliError> {
         if response.body.trim().is_empty() {
+            // Ответ на notification (например, HTTP 202) не содержит тела.
             return Ok(json!({}));
         }
-        serde_json::from_str(&response.body).map_err(|_| {
-            HaCliError::new(
+        let content_type = response.header("Content-Type").unwrap_or_default();
+        let data = if content_type.contains("text/event-stream") {
+            // ha-mcp отвечает SSE: искать JSON-RPC сообщение с нашим id.
+            match parse_sse_message(&response.body, expected_id)? {
+                Some(message) => message,
+                None => {
+                    return Err(HaCliError::new(
+                        ErrorType::HaApi,
+                        "MCP event-stream response does not contain a matching JSON-RPC reply",
+                    ))
+                }
+            }
+        } else {
+            serde_json::from_str(&response.body).map_err(|_| {
+                HaCliError::new(
+                    ErrorType::HaApi,
+                    "Home Assistant returned an invalid JSON response",
+                )
+            })?
+        };
+        // Ответ обязан соответствовать отправленному запросу по JSON-RPC id.
+        if data.get("id").and_then(Json::as_u64) != Some(expected_id) {
+            return Err(HaCliError::new(
                 ErrorType::HaApi,
-                "Home Assistant returned an invalid JSON response",
-            )
-        })
+                format!("MCP response for {expected_id} has a mismatched JSON-RPC id"),
+            ));
+        }
+        Ok(data)
     }
 
     /// Перенос `Client._call`.
@@ -134,7 +157,7 @@ impl Client {
         self.next_id += 1;
         let payload = build_request(self.next_id, method, params);
         let response = self.post(&payload)?;
-        let data = self.parse_body(&response)?;
+        let data = self.parse_body(&response, self.next_id)?;
         if let Some(err) = data.get("error") {
             let message = err
                 .get("message")
@@ -225,10 +248,71 @@ pub fn build_notification(method: &str, params: Option<&Json>) -> Json {
     payload
 }
 
+/// Ограничение числа SSE-событий в одном ответе: защищает от бесконечного
+/// потока событий без соответствующего id.
+pub const MAX_SSE_EVENTS: usize = 10_000;
+
+/// Разбор SSE-тела: возвращает JSON-RPC сообщение, чей `id` совпадает с
+/// ожидаемым. `Ok(None)` — совпадения нет. События без `data`, комментарии
+/// и не-JSON данные пропускаются; число событий ограничено `MAX_SSE_EVENTS`.
+pub fn parse_sse_message(body: &str, expected_id: u64) -> Result<Option<Json>, HaCliError> {
+    let mut data = String::new();
+    let mut events = 0usize;
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            let rest = rest.strip_prefix(' ').unwrap_or(rest);
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest);
+        } else if !line.trim().is_empty() {
+            // event:/id:/retry:/комментарии игнорируются: важно только data.
+            continue;
+        } else {
+            // Пустая строка завершает событие.
+            if let Some(message) = take_event(&mut data, expected_id, &mut events)? {
+                return Ok(Some(message));
+            }
+        }
+    }
+    take_event(&mut data, expected_id, &mut events)
+}
+
+/// Финализирует накопленный `data` одного события. Возвращает `Ok(Some(msg))`,
+/// если это JSON с совпадающим `id`; `Ok(None)` — иначе.
+fn take_event(
+    data: &mut String,
+    expected_id: u64,
+    events: &mut usize,
+) -> Result<Option<Json>, HaCliError> {
+    if data.is_empty() {
+        return Ok(None);
+    }
+    *events += 1;
+    if *events > MAX_SSE_EVENTS {
+        return Err(HaCliError::new(
+            ErrorType::HaApi,
+            "MCP event-stream response has too many events",
+        ));
+    }
+    let parsed = serde_json::from_str::<Json>(data).ok();
+    data.clear();
+    match parsed {
+        Some(message) if message.get("id").and_then(Json::as_u64) == Some(expected_id) => {
+            Ok(Some(message))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Реальный HTTP-транспорт: reqwest blocking + rustls.
 pub struct HttpTransport {
     http: reqwest::blocking::Client,
 }
+
+/// Верхняя граница размера тела ответа: неограниченное чтение SSE-потока
+/// способно исчерпать память.
+pub const MAX_RESPONSE_BODY_BYTES: u64 = 10 * 1024 * 1024;
 
 impl HttpTransport {
     pub fn new(config: &Config) -> Result<Self, HaCliError> {
@@ -242,6 +326,10 @@ impl HttpTransport {
             reqwest::header::HeaderValue::from_static("application/json, text/event-stream"),
         );
         let http = reqwest::blocking::Client::builder()
+            // Таймаут установки соединения отделён от общего таймаута
+            // исполнения: сервисы ha-mcp могут ожидать подтверждения
+            // изменения состояния внутри уже открытого запроса.
+            .connect_timeout(std::time::Duration::from_secs(config.connect_timeout))
             .timeout(std::time::Duration::from_secs(config.timeout))
             .default_headers(headers)
             .build()
@@ -295,13 +383,47 @@ impl Transport for HttpTransport {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_string()))
             .collect();
-        let body = response.text().map_err(|e| {
-            let message = if e.is_timeout() {
-                "Request to Home Assistant timed out"
+        // Читаем не больше MAX_RESPONSE_BODY_BYTES + 1 байт: лишний байт
+        // означает, что ответ усечён.
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        // Запрос уже отправлен: таймаут здесь не означает, что операция не
+        // выполнена (сервисы ha-mcp могут ждать подтверждения состояния).
+        if let Err(e) = response
+            .take(MAX_RESPONSE_BODY_BYTES + 1)
+            .read_to_end(&mut bytes)
+        {
+            // reqwest оборачивает таймаут в io::Error (kind Other) с исходным
+            // reqwest::Error внутри — распознаём таймаут через downcast.
+            let timed_out = e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+                .map(reqwest::Error::is_timeout)
+                .unwrap_or_else(|| e.kind() == std::io::ErrorKind::TimedOut);
+            return Err(if timed_out {
+                HaCliError::new(
+                    ErrorType::Connection,
+                    "Home Assistant response timed out after the request was sent; \
+                 the operation may still have been performed",
+                )
             } else {
-                "Unable to connect to Home Assistant"
-            };
-            HaCliError::new(ErrorType::Connection, message)
+                HaCliError::new(
+                    ErrorType::Connection,
+                    "Unable to read response from Home Assistant",
+                )
+            });
+        }
+        if bytes.len() as u64 > MAX_RESPONSE_BODY_BYTES {
+            return Err(HaCliError::new(
+                ErrorType::HaApi,
+                "Home Assistant response exceeds the size limit",
+            ));
+        }
+        let body = String::from_utf8(bytes).map_err(|_| {
+            HaCliError::new(
+                ErrorType::HaApi,
+                "Home Assistant returned a non-UTF-8 response",
+            )
         })?;
         Ok(HttpResponse {
             status,
@@ -407,6 +529,26 @@ mod tests {
             mcp_auth,
             token: token.to_string(),
             timeout: 5,
+            connect_timeout: 5,
+        }
+    }
+
+    fn sse_response(id: u64, result: Json) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+            body: format!(
+                "event: message\ndata: {}\n\n",
+                json!({"jsonrpc": "2.0", "id": id, "result": result})
+            ),
+        }
+    }
+
+    fn empty_response(status: u16) -> HttpResponse {
+        HttpResponse {
+            status,
+            headers: Vec::new(),
+            body: String::new(),
         }
     }
 
@@ -486,5 +628,240 @@ mod tests {
         let mut client = Client::new(config, Box::new(transport.clone()), &Secrets::new());
         client.initialize().unwrap();
         assert_eq!(transport.last_url(), "http://ha.local/private_secret");
+    }
+
+    #[test]
+    fn sse_initialize_and_tools_list_are_parsed_by_id() {
+        let config = config_from(
+            Some("http://ha.local/api/webhook/sec"),
+            McpAuth::HaAuth,
+            "tok",
+        );
+        let transport = SharedTransport::new();
+        transport.0.borrow_mut().response =
+            sse_response(1, json!({"protocolVersion": "2025-03-26"}));
+        let mut client = Client::new(config, Box::new(transport.clone()), &Secrets::new());
+        let init = client.initialize().unwrap();
+        assert_eq!(
+            init.get("protocolVersion").and_then(Json::as_str),
+            Some("2025-03-26")
+        );
+        transport.0.borrow_mut().response =
+            sse_response(2, json!({"tools": [{"name": "ha_search"}]}));
+        let tools = client.tools_list().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0].get("name").and_then(Json::as_str),
+            Some("ha_search")
+        );
+        // После initialize последующие запросы несут версию протокола.
+        let requests = transport.0.borrow().requests.borrow().clone();
+        let last_headers = &requests.last().unwrap().2;
+        assert!(last_headers
+            .iter()
+            .any(|(k, v)| k == "MCP-Protocol-Version" && v == "2025-03-26"));
+    }
+
+    #[test]
+    fn notification_with_empty_202_body_is_accepted() {
+        let config = config_from(None, McpAuth::None, "tok");
+        let transport = SharedTransport::new();
+        transport.0.borrow_mut().response = empty_response(202);
+        let mut client = Client::new(config, Box::new(transport.clone()), &Secrets::new());
+        client.notify("notifications/initialized", None).unwrap();
+    }
+
+    #[test]
+    fn sse_event_without_matching_id_is_an_error() {
+        let config = config_from(None, McpAuth::None, "tok");
+        let transport = SharedTransport::new();
+        transport.0.borrow_mut().response = sse_response(99, json!({}));
+        let mut client = Client::new(config, Box::new(transport.clone()), &Secrets::new());
+        let err = client.call("tools/list", None).unwrap_err();
+        assert!(matches!(err.kind, ErrorType::HaApi));
+        assert!(err.message.contains("matching JSON-RPC reply"));
+    }
+
+    #[test]
+    fn malformed_sse_is_a_sanitized_error() {
+        let config = config_from(None, McpAuth::None, "tok");
+        let transport = SharedTransport::new();
+        transport.0.borrow_mut().response = HttpResponse {
+            status: 200,
+            headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+            body: "data: not-json\n\n".to_string(),
+        };
+        let mut client = Client::new(config, Box::new(transport.clone()), &Secrets::new());
+        let err = client.call("tools/list", None).unwrap_err();
+        assert!(matches!(err.kind, ErrorType::HaApi));
+        // Тело ответа не отражается в ошибке.
+        assert!(!err.message.contains("not-json"));
+    }
+
+    #[test]
+    fn json_response_with_mismatched_id_is_rejected() {
+        let config = config_from(None, McpAuth::None, "tok");
+        let transport = SharedTransport::new();
+        transport.0.borrow_mut().response = HttpResponse {
+            status: 200,
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            body: json!({"jsonrpc": "2.0", "id": 42, "result": {}}).to_string(),
+        };
+        let mut client = Client::new(config, Box::new(transport.clone()), &Secrets::new());
+        let err = client.call("tools/list", None).unwrap_err();
+        assert!(err.message.contains("mismatched JSON-RPC id"));
+    }
+
+    #[test]
+    fn sse_parser_selects_event_by_id_among_noise() {
+        let body = ": comment\n\
+                    data: {\"jsonrpc\": \"2.0\", \"id\": 1, \"result\": {\"n\": 1}}\n\
+                    \n\
+                    data: {\"jsonrpc\": \"2.0\", \"method\": \"x\"}\n\
+                    \n\
+                    data: {\"jsonrpc\": \"2.0\", \"id\": 2,\n\
+                    data:  \"result\": {\"tools\": [1, 2]}}\n\
+                    \n";
+        let message = parse_sse_message(body, 2).unwrap().unwrap();
+        assert_eq!(message["result"]["tools"].as_array().unwrap().len(), 2);
+        assert!(parse_sse_message(body, 7).unwrap().is_none());
+    }
+
+    #[test]
+    fn sse_parser_is_bounded() {
+        let event = "data: {\"jsonrpc\": \"2.0\", \"id\": 1, \"result\": {}}\n\n";
+        let body = event.repeat(MAX_SSE_EVENTS + 1);
+        // Ни одно событие не совпадает: парсер ограничен числом событий.
+        let err = parse_sse_message(&body, 99).unwrap_err();
+        assert!(err.message.contains("too many events"));
+    }
+
+    /// Минимальный локальный HTTP/1.1 сервер: отдаёт заготовленные ответы по
+    /// одному на соединение — для проверки реального HttpTransport. Возвращает
+    /// адрес и головы полученных запросов.
+    fn serve_responses(
+        responses: Vec<String>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let seen_thread = seen.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for response in responses {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let mut data = Vec::new();
+                loop {
+                    let n = match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    data.extend_from_slice(&buf[..n]);
+                    if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                // Дочитываем тело запроса по Content-Length.
+                let head = String::from_utf8_lossy(&data).to_string();
+                if let Some(len) = head.split("\r\n").find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                }) {
+                    let header_end = head.find("\r\n\r\n").map(|i| i + 4).unwrap_or(data.len());
+                    while data.len() < header_end + len {
+                        match sock.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => data.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                }
+                seen_thread.lock().unwrap().push(head);
+                sock.write_all(response.as_bytes()).ok();
+            }
+        });
+        (format!("http://{addr}/api/webhook/test"), seen)
+    }
+
+    /// Собирает сырой HTTP-ответ с корректным Content-Length для SSE-тела.
+    fn sse_raw(id: u64, result: &str) -> String {
+        let data = format!(
+            "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}\n\n"
+        );
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nMcp-Session-Id: sess-1\r\nContent-Length: {}\r\n\r\n{}",
+            data.len(),
+            data
+        )
+    }
+
+    const ACCEPTED_RESPONSE: &str = "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n";
+
+    #[test]
+    fn live_transport_reads_sse_and_echoes_session_header() {
+        let init = sse_raw(1, "{\"protocolVersion\":\"2025-03-26\"}");
+        let tools = sse_raw(2, "{\"tools\":[{\"name\":\"ha_search\"}]}");
+        let (url, seen) = serve_responses(vec![init, ACCEPTED_RESPONSE.to_string(), tools]);
+        let config = config_from(Some(&url), McpAuth::None, "");
+        let transport = HttpTransport::new(&config).unwrap();
+        let mut client = Client::new(config, Box::new(transport), &Secrets::new());
+        let tools = client.tools_list().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0].get("name").and_then(Json::as_str),
+            Some("ha_search")
+        );
+        // Сессия, полученная от initialize, повторяется в tools/list.
+        let heads = seen.lock().unwrap().clone();
+        // reqwest нормализует имена заголовков в нижний регистр.
+        assert!(heads
+            .last()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("mcp-session-id: sess-1"));
+    }
+
+    #[test]
+    fn live_transport_reports_auth_failure() {
+        let (url, _seen) = serve_responses(vec![
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".to_string(),
+        ]);
+        let config = config_from(Some(&url), McpAuth::None, "");
+        let transport = HttpTransport::new(&config).unwrap();
+        let mut client = Client::new(config, Box::new(transport), &Secrets::new());
+        let err = client.call("tools/list", None).unwrap_err();
+        assert!(matches!(err.kind, ErrorType::Authentication));
+    }
+
+    #[test]
+    fn read_timeout_after_sent_request_does_not_claim_failure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            // Заголовки отправлены сразу, тело — после истечения клиентского
+            // таймаута: ошибка возникает уже на чтении ответа.
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n",
+            )
+            .ok();
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            sock.write_all(b"{}").ok();
+        });
+        let mut config = config_from(Some(&format!("http://{addr}/")), McpAuth::None, "");
+        config.timeout = 1;
+        config.connect_timeout = 1;
+        let transport = HttpTransport::new(&config).unwrap();
+        let mut client = Client::new(config, Box::new(transport), &Secrets::new());
+        let err = client.call("tools/list", None).unwrap_err();
+        assert!(matches!(err.kind, ErrorType::Connection));
+        assert!(err.message.contains("request was sent"));
+        assert!(err.message.contains("may still have been performed"));
     }
 }

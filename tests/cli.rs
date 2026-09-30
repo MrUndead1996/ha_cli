@@ -105,6 +105,7 @@ fn make_client(transport: FakeTransport) -> Client {
         mcp_auth: Default::default(),
         token: "test-token".to_string(),
         timeout: 5,
+        connect_timeout: 5,
     };
     Client::new(config, Box::new(transport), &secrets)
 }
