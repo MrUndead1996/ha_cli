@@ -162,6 +162,50 @@ ha-mcp при поиске, применяется только внутри CLI
 - Контекст не теряет сущности из-за пагинации и явно сообщает о неполноте;
   ошибки и отладочный вывод не раскрывают URL с секретом или токен.
 
+## Результаты этапа 1: проверка действующего сервера (2026-09-30)
+
+Проверено запросами к запущенному HACS in-process серверу на Home Assistant
+2026.9.4 (версия HA сообщена владельцем). Подключение через webhook в режиме
+`ha_auth` с Long-Lived Access Token администратора: `/api/` принимает токен,
+HA `auth/current_user` возвращает `is_admin=true`. Сам URL и токен в репозиторий
+не записывались.
+
+- `initialize`: HTTP 200, `Content-Type: text/event-stream`, MCP
+  `protocolVersion=2025-03-26`, `serverInfo={name: "ha-mcp", version: "8.6.0"}`.
+  `notifications/initialized`: HTTP 202. Сервер не прислал `Mcp-Session-Id`
+  в проверенном обмене; поддержка заголовка в будущем всё равно нужна.
+- `tools/list`: HTTP 200 с SSE, 77 инструментов; доступны `ha_search`,
+  `ha_get_state`, `ha_call_service`, `ha_list_services`. У `ha_search`
+  параметры `query`, `domain_filter`, `area_filter`, `limit`, `offset`,
+  `include_hidden`, `result_fields`, `fields`; `ha_get_state` требует
+  `entity_id`; у `ha_call_service` есть `domain`, `service`, `entity_id`,
+  `data`, `wait`; у `ha_list_services` — `domain`, `detail_level`, `limit`,
+  `offset`. Версию 8.6.0 подтвердил также `ha_get_overview` с проекцией
+  `fields=["ha_mcp_update"]`.
+- `ha_search(domain_filter="light", limit=1)` вернул одну сущность,
+  `entity_total_matches=1`, `partial=false`, `entity_has_more=false`.
+  Ответ содержит `entities`, `entity_total_matches`, `partial`, `errors`,
+  `warnings`, `entity_has_more`, `entity_next_offset`, `offset`, `limit`.
+  Для полного списка учитывать **именно** `entity_has_more` /
+  `entity_next_offset`, а также `partial` и `errors`; `limit=1` здесь не
+  доказывает поведение на нескольких страницах.
+- `ha_get_state` по ID, полученному из `ha_search`, успешно вернул
+  `data={state, attributes}` и `metadata`. В атрибутах проверенной лампы
+  есть `supported_color_modes`, `brightness`, `color_temp_kelvin`.
+- `ha_list_services(domain="light", detail_level="full")` подтвердил
+  сервис `light.turn_on` с полем `color_temp_kelvin` (необязательное,
+  selector `color_temp`). Другие поля этого сервиса включают `transition`,
+  `rgb_color`, `brightness_pct`, `brightness_step_pct`, `effect`.
+
+Дополнительная проверка области `bathroom`: `ha_search(area_filter="bathroom")`
+вернул три сущности, `partial=false`, ошибок нет. Владелец подтвердил, что
+неэкспонированные сущности этой области отсутствуют в результате. Это
+подтверждение состава владельцем, а не отдельный поиск по имени скрытой
+сущности. Для `bathroom` проверена пагинация с `limit=1`: три страницы по
+одной сущности, `entity_next_offset` последовательно `1`, `2`, затем `null`,
+`entity_has_more` — `true`, `true`, `false`; сумма равна
+`entity_total_matches=3`. Этап 1 завершён без вызовов сервисов управления.
+
 ## Источники для сверки при реализации
 
 - [ha-mcp: варианты установки и перечень инструментов](https://github.com/homeassistant-ai/ha-mcp)
