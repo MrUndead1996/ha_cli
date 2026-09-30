@@ -85,10 +85,10 @@ MCP over HTTP JSON-RPC (`/api/mcp/assist`, protocolVersion `2025-03-26`).
 - [x] `query_state` — casefold-сопоставление area/domain/name
 - [x] Тесты: `test_context.py` → `tests/context.rs`
 
-### Phase 5 — CLI-склейка и паритет
+### Phase 5 — CLI-склейка и паритет (готово)
 
-- [ ] `cli.rs`: маршрутизация команд, парсинг payload (`serde_json`, значение обязано быть object), `--debug` с redact-трейсбеком
-- [ ] Сквозные тесты против мок-сервера (`test_cli.py`)
+- [x] `cli.rs`: маршрутизация команд, парсинг payload (`serde_json`, значение обязано быть object), `--debug` с redact-трейсбеком
+- [x] Сквозные тесты против мок-сервера (`test_cli.py`)
 - [ ] Сверка вывода с Python-версией на реальном HA (diff stdout)
 
 ### Phase 6 — упаковка и деплой

@@ -12,7 +12,7 @@ pub const EXIT_TOOL_NOT_FOUND: u8 = 8;
 pub const EXIT_AMBIGUOUS_TOOL: u8 = 9;
 pub const EXIT_CONTEXT_ERROR: u8 = 10;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ErrorType {
     Generic,
     InvalidArguments,
@@ -58,7 +58,7 @@ impl ErrorType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HaCliError {
     pub kind: ErrorType,
     pub message: String,
