@@ -89,14 +89,14 @@ MCP over HTTP JSON-RPC (`/api/mcp/assist`, protocolVersion `2025-03-26`).
 
 - [x] `cli.rs`: маршрутизация команд, парсинг payload (`serde_json`, значение обязано быть object), `--debug` с redact-трейсбеком
 - [x] Сквозные тесты против мок-сервера (`test_cli.py`)
-- [ ] Сверка вывода с Python-версией на реальном HA (diff stdout)
+- [x] Сверка вывода с Python-версией на реальном HA (стенд claw.mrundead.org, aarch64: context/tools/intent + ошибочные сценарии — побайтово идентичны, включая exit-коды)
 
-### Phase 6 — упаковка и деплой
+### Phase 6 — упаковка и деплой (готово)
 
-- [ ] CI: `cargo fmt --check && cargo clippy -- -D warnings && cargo test`
-- [ ] Release-сборка (`panic=abort`, LTO) + артефакты x86_64/aarch64-linux
-- [ ] Обновить `deploy-nanobot.sh`: копирование бинарника вместо pip-установки
-- [ ] README репозитория, пометить Python-версию как legacy
+- [x] CI: `cargo fmt --check && cargo clippy -- -D warnings && cargo test` (.github/workflows/ci.yml)
+- [x] Release-сборка (`panic=abort`, LTO, strip) + артефакты x86_64/aarch64-linux-musl (.github/workflows/release.yml, теги `v*`; aarch64 — основная архитектура, собирается нативно на ubuntu-24.04-arm)
+- [ ] Обновить `deploy-nanobot.sh` в nanobot_workspace: скачивание tar.gz с релизов вместо pip-установки (после первого тега)
+- [ ] README репозитория: секция установки из релизов, пометить Python-версию как legacy
 
 ## Отличия, требующие внимания
 

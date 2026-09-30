@@ -215,7 +215,7 @@ fn intent_success_prints_json_stdout() {
     let out = result.unwrap();
     assert_eq!(
         out,
-        "{\"ok\":true,\"response_type\":\"action_done\",\"speech\":\"Turned on\"}\n"
+        "{\"ok\": true, \"response_type\": \"action_done\", \"speech\": \"Turned on\"}\n"
     );
     assert_eq!(
         fake.calls(),
@@ -359,7 +359,7 @@ fn intent_default_payload_empty_object() {
     let out = result.unwrap();
     assert_eq!(
         out,
-        "{\"ok\":true,\"response_type\":\"action_done\",\"speech\":\"\"}\n"
+        "{\"ok\": true, \"response_type\": \"action_done\", \"speech\": \"\"}\n"
     );
     assert_eq!(fake.calls(), vec![("HassTurnOn".to_string(), json!({}))]);
 }
@@ -404,7 +404,7 @@ fn context_success_prints_parsed_json_stdout() {
         json!({"ok": true, "areas": {"Kitchen": {"light": ["Kitchen Light"]}}})
     );
     // Порядок ключей: ok, areas.
-    assert!(out.starts_with("{\"ok\":true,\"areas\":"));
+    assert!(out.starts_with("{\"ok\": true, \"areas\":"));
     assert_eq!(
         fake.calls(),
         vec![("GetLiveContext".to_string(), json!({}))]
@@ -525,7 +525,7 @@ fn context_compact_prints_flat_compact_json() {
         serde_json::from_str::<Json>(out.trim_end()).unwrap(),
         json!({"ok": true, "Kitchen": {"light": ["Kitchen Light"]}})
     );
-    assert!(out.starts_with("{\"ok\":true,\"Kitchen\":"));
+    assert!(out.starts_with("{\"ok\": true, \"Kitchen\":"));
 }
 
 // --- config ---
