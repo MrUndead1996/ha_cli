@@ -74,14 +74,14 @@ impl HaCliError {
     }
 
     pub fn to_json(&self) -> String {
-        json!({
+        // Python json.dumps использует разделители (', ', ': ').
+        crate::output::dumps(&json!({
             "ok": false,
             "error": {
                 "type": self.kind.as_str(),
                 "message": self.message,
             },
-        })
-        .to_string()
+        }))
     }
 }
 

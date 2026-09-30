@@ -159,8 +159,10 @@ pub fn dispatch(cli: &Cli, client: &mut Client) -> Result<String, HaCliError> {
 /// Перенос `output.output_json`: компактный JSON + '\n'
 /// (serde_json по умолчанию не экранирует не-ASCII — паритет
 /// с json.dump(ensure_ascii=False)).
+/// Перенос `output.output_json`: Python `json.dump` с разделителями
+/// (', ', ': ') + '\n' (см. crate::output).
 fn to_json_line(data: &Json) -> String {
-    let mut text = serde_json::to_string(data).expect("JSON serialization cannot fail");
+    let mut text = crate::output::dumps(data);
     text.push('\n');
     text
 }

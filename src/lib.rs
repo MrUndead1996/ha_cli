@@ -6,4 +6,5 @@ pub mod discovery;
 pub mod errors;
 pub mod intents;
 pub mod models;
+pub mod output;
 pub mod security;
