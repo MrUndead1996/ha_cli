@@ -7,5 +7,6 @@ pub mod errors;
 pub mod intents;
 pub mod models;
 pub mod output;
+pub mod resolver;
 pub mod security;
 pub mod tool_result;

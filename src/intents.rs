@@ -2,6 +2,7 @@ use crate::client::Client;
 use crate::context;
 use crate::discovery::{get_tool as find_tool, is_stale_tool_result, ToolDiscovery};
 use crate::errors::{ErrorType, HaCliError};
+use crate::resolver;
 use crate::security;
 use crate::tool_result::{extract_text, success_failure_message, tool_error_message, truthy};
 use serde_json::{json, Map, Value as Json};
@@ -32,6 +33,19 @@ pub fn execute(client: &mut Client, intent: &str, payload: &Json) -> Result<Json
     validate_intent(intent)?;
     if let Err(message) = security::validate_entity_payload(payload) {
         return Err(HaCliError::new(ErrorType::InvalidArguments, message));
+    }
+    // Этап 3.2 (docs/mcp_migration.md): на ha-mcp (`mcp_url` задан) действие
+    // сначала строго разрешается по отфильтрованному каталогу `ha_search` —
+    // ноль/неоднозначные совпадения и превышение bound массового набора
+    // отклоняются ДО любого вызова инструмента действия. Путь исполнения
+    // (ha_call_service) появится на этапе 4; HassGetState мигрирует на 3.3.
+    // Assist endpoint без `mcp_url` работает как раньше.
+    if client.config.mcp_url.is_some() && intent != "HassGetState" {
+        resolver::prepare_action(client, payload)?;
+        return Err(HaCliError::new(
+            ErrorType::ToolNotFound,
+            format!("ha-mcp execution for {intent} is not implemented yet"),
+        ));
     }
     let mut discovery = ToolDiscovery::new(None);
     let tool = match discovery.get_tool(client, intent) {
@@ -164,5 +178,61 @@ fn extract_speech(speech: &Json) -> String {
             .unwrap_or_default()
             .to_string(),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::{HttpResponse, Transport};
+    use crate::config::{Config, McpAuth};
+    use crate::security::Secrets;
+
+    /// Транспорт, который «падает» при любом запросе: если после запрета
+    /// entity_id произойдёт хоть один сетевой вызов, тест это увидит.
+    struct NoNetwork;
+
+    impl Transport for NoNetwork {
+        fn post(
+            &mut self,
+            _url: &str,
+            _payload: &Json,
+            _headers: &[(String, String)],
+        ) -> Result<HttpResponse, HaCliError> {
+            panic!("no network request is allowed after payload validation")
+        }
+    }
+
+    fn mcp_client() -> Client {
+        let config = Config {
+            url: Some("http://ha.local".to_string()),
+            mcp_url: Some("http://ha.local/api/webhook/test".to_string()),
+            mcp_auth: McpAuth::None,
+            token: String::new(),
+            timeout: 5,
+            connect_timeout: 5,
+        };
+        Client::new(config, Box::new(NoNetwork), &Secrets::new())
+    }
+
+    #[test]
+    fn entity_id_in_payload_is_rejected_before_any_request() {
+        let mut client = mcp_client();
+        for payload in [
+            json!({"entity_id": "light.kitchen"}),
+            json!({"name": "light.kitchen"}),
+            json!({"data": {"entity_ids": ["light.kitchen"]}}),
+        ] {
+            let err = execute(&mut client, "HassTurnOn", &payload).unwrap_err();
+            assert!(matches!(err.kind, ErrorType::InvalidArguments));
+        }
+    }
+
+    #[test]
+    fn action_without_semantic_target_is_invalid_arguments() {
+        let mut client = mcp_client();
+        // Транспорт не вызывается: селекторы проверяются до сети.
+        let err = execute(&mut client, "HassTurnOn", &json!({})).unwrap_err();
+        assert!(matches!(err.kind, ErrorType::InvalidArguments));
     }
 }
