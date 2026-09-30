@@ -142,7 +142,9 @@ pub fn dispatch(cli: &Cli, client: &mut Client) -> Result<String, HaCliError> {
             }
         }
         Command::Tools { json, refresh } => {
-            let mut discovery = ToolDiscovery::new(None);
+            // Кэш изолирован по endpoint: Assist и ha-mcp (и разные ha-mcp
+            // URL) не делят файл кэша; `tools --refresh` работает как раньше.
+            let mut discovery = ToolDiscovery::for_endpoint(client.config.mcp_url.as_deref());
             let mapping = if *refresh {
                 discovery.tools_refresh(client)?
             } else {

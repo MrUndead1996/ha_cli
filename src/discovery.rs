@@ -2,6 +2,7 @@ use crate::client::Client;
 use crate::errors::{ErrorType, HaCliError};
 use crate::security::expanduser;
 use serde_json::{json, Value as Json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -83,8 +84,14 @@ pub fn get_tool<'a>(mapping: &'a ToolMapping, basename: &str) -> Result<&'a Tool
     }
 }
 
-/// Перенос `save_cache`: запись JSON с правами 0600.
-pub fn save_cache(mapping: &ToolMapping, cache_path: &str) -> Result<(), HaCliError> {
+/// Перенос `save_cache`: запись JSON с правами 0600. Файл привязывается
+/// к endpoint через поле `endpoint` (идентификатор без секретов) — кэш,
+/// записанный для другого сервера, никогда не будет прочитан.
+pub fn save_cache(
+    mapping: &ToolMapping,
+    cache_path: &str,
+    endpoint_id: &str,
+) -> Result<(), HaCliError> {
     let path = expanduser(cache_path);
     let path = Path::new(&path);
     if let Some(parent) = path.parent() {
@@ -106,20 +113,28 @@ pub fn save_cache(mapping: &ToolMapping, cache_path: &str) -> Result<(), HaCliEr
         .map_err(|e| {
             HaCliError::new(ErrorType::Generic, format!("cannot chmod tool cache: {e}"))
         })?;
-    let payload = json!({"tools": mapping.source_tools});
+    let payload = json!({"endpoint": endpoint_id, "tools": mapping.source_tools});
     write!(file, "{payload}").map_err(|e| {
         HaCliError::new(ErrorType::Generic, format!("cannot write tool cache: {e}"))
     })?;
     Ok(())
 }
 
-/// Перенос `load_cache`.
-pub fn load_cache(cache_path: &str) -> Result<ToolMapping, HaCliError> {
+/// Перенос `load_cache` с привязкой к endpoint: файл без поля `endpoint`
+/// (legacy-кэш до разделения) либо с ЧУЖИМ идентификатором — invalid
+/// (fail-safe: такой кэш не подставляется, будет refresh).
+pub fn load_cache(cache_path: &str, endpoint_id: &str) -> Result<ToolMapping, HaCliError> {
     let path = expanduser(cache_path);
     let text = std::fs::read_to_string(&path)
         .map_err(|_| HaCliError::new(ErrorType::Generic, "invalid tool cache".to_string()))?;
     let data: Json = serde_json::from_str(&text)
         .map_err(|_| HaCliError::new(ErrorType::Generic, "invalid tool cache".to_string()))?;
+    if data.get("endpoint").and_then(Json::as_str) != Some(endpoint_id) {
+        return Err(HaCliError::new(
+            ErrorType::Generic,
+            "invalid tool cache".to_string(),
+        ));
+    }
     let Some(tools) = data.get("tools").and_then(Json::as_array) else {
         return Err(HaCliError::new(
             ErrorType::Generic,
@@ -129,13 +144,49 @@ pub fn load_cache(cache_path: &str) -> Result<ToolMapping, HaCliError> {
     Ok(discover_tools(tools.clone()))
 }
 
+/// Идентификатор endpoint в имени и содержимом файла кэша для прежнего
+/// Assist сервера. Кэш ha-mcp использует отдельный идентификатор
+/// (`hamcp-<sha256>`), поэтому Assist-кэш с `Hass*` инструментами
+/// физически не может быть подставлен в ha-mcp-сессию.
+pub const ASSIST_ENDPOINT_ID: &str = "assist";
+
+/// Идентификатор endpoint для изоляции кэша схем инструментов
+/// (docs/mcp_migration.md, этап 5, подпункт 1): Assist — константа;
+/// ha-mcp — SHA-256 от ПОЛНОГО URL, включая секретный webhook path.
+/// Обоснование выбора дайджеста: в проекте ещё нет криптографического
+/// digest, а URL сам является секретом — детерминированный «дешёвый»
+/// отпечаток (длина, хост, CRC и т.п.) позволил бы перебором восстановить
+/// приватный URL; SHA-256 не раскрывает URL и не содержит секрета ни в
+/// каком виде, поэтому безопасен и в имени файла, и в содержимом кэша.
+/// Разные ha-mcp endpoint'ы (другой webhook/хост) получают разные файлы
+/// и не видят кэш друг друга.
+pub fn endpoint_cache_id(mcp_url: Option<&str>) -> String {
+    match mcp_url {
+        None => ASSIST_ENDPOINT_ID.to_string(),
+        Some(url) => {
+            let digest = Sha256::digest(url.as_bytes());
+            let mut hex = String::with_capacity(digest.len() * 2);
+            for byte in digest {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            format!("hamcp-{hex}")
+        }
+    }
+}
+
 /// Перенос `default_cache_path`.
 pub fn default_cache_path() -> String {
+    default_cache_path_for(ASSIST_ENDPOINT_ID)
+}
+
+/// Путь кэша для конкретного endpoint: `~/.cache/ha-cli/tools-<id>.json`.
+/// Имя файла не содержит URL — только несекретный дайджест.
+pub fn default_cache_path_for(endpoint_id: &str) -> String {
     let cache_home = std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| "~/.cache".to_string());
     let expanded = expanduser(&cache_home);
     Path::new(&expanded)
         .join("ha-cli")
-        .join("tools.json")
+        .join(format!("tools-{endpoint_id}.json"))
         .to_string_lossy()
         .into_owned()
 }
@@ -173,15 +224,26 @@ fn now_secs() -> u64 {
 /// не позволяет удерживать `&mut Client` в поле).
 pub struct ToolDiscovery {
     pub cache_path: String,
+    pub endpoint_id: String,
     pub cache_ttl: u64,
     mapping: Option<ToolMapping>,
     from_cache: bool,
 }
 
 impl ToolDiscovery {
+    /// Контракт сохранён: `new(Some(путь))` и `new(None)` (default Assist
+    /// путь). Endpoint — прежний Assist.
     pub fn new(cache_path: Option<String>) -> Self {
+        Self::with_ttl(cache_path, DEFAULT_CACHE_TTL)
+    }
+
+    /// Кэш для конкретного endpoint: Assist без `mcp_url`, ha-mcp — по
+    /// дайджесту полного URL. Разные серверы никогда не делят один файл.
+    pub fn for_endpoint(mcp_url: Option<&str>) -> Self {
+        let endpoint_id = endpoint_cache_id(mcp_url);
         Self {
-            cache_path: cache_path.unwrap_or_else(default_cache_path),
+            cache_path: default_cache_path_for(&endpoint_id),
+            endpoint_id,
             cache_ttl: DEFAULT_CACHE_TTL,
             mapping: None,
             from_cache: false,
@@ -189,9 +251,13 @@ impl ToolDiscovery {
     }
 
     pub fn with_ttl(cache_path: Option<String>, cache_ttl: u64) -> Self {
-        let mut this = Self::new(cache_path);
-        this.cache_ttl = cache_ttl;
-        this
+        Self {
+            cache_path: cache_path.unwrap_or_else(default_cache_path),
+            endpoint_id: ASSIST_ENDPOINT_ID.to_string(),
+            cache_ttl,
+            mapping: None,
+            from_cache: false,
+        }
     }
 
     pub fn from_cache(&self) -> bool {
@@ -219,7 +285,7 @@ impl ToolDiscovery {
     /// Перенос `refresh`.
     pub fn refresh(&mut self, client: &mut Client) -> Result<ToolMapping, HaCliError> {
         let mapping = discover_tools(client.tools_list()?);
-        save_cache(&mapping, &self.cache_path)?;
+        save_cache(&mapping, &self.cache_path, &self.endpoint_id)?;
         self.from_cache = false;
         self.mapping = Some(mapping.clone());
         Ok(mapping)
@@ -260,6 +326,6 @@ impl ToolDiscovery {
         if now_secs().saturating_sub(mtime_secs) > self.cache_ttl {
             return None;
         }
-        load_cache(&self.cache_path).ok()
+        load_cache(&self.cache_path, &self.endpoint_id).ok()
     }
 }

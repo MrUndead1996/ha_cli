@@ -48,7 +48,7 @@ pub fn get_raw_result(client: &mut Client) -> Result<Json, HaCliError> {
 
 /// Прежний Assist-путь `get_raw_result` (без изменений).
 fn get_raw_result_assist(client: &mut Client) -> Result<Json, HaCliError> {
-    let mut discovery = ToolDiscovery::new(None);
+    let mut discovery = ToolDiscovery::for_endpoint(client.config.mcp_url.as_deref());
     let tool = discovery.get_tool(client, ASSIST_CONTEXT_TOOL)?;
     let arguments = build_arguments(&tool.input_schema)?;
     let result = client.tools_call(&tool.mcp_name, &arguments)?;
@@ -78,7 +78,7 @@ pub fn get_live_context(client: &mut Client) -> Result<Json, HaCliError> {
 /// `entity_total_matches`) никогда не выдаётся как полный.
 pub fn collect_ha_search_entities(client: &mut Client) -> Result<Json, HaCliError> {
     let context_error = |message: String| HaCliError::new(ErrorType::Context, message);
-    let mut discovery = ToolDiscovery::new(None);
+    let mut discovery = ToolDiscovery::for_endpoint(client.config.mcp_url.as_deref());
     let domains = collect_domains_via_overview(client, &mut discovery)?;
     let mut search_tool = discovery.get_tool(client, HA_SEARCH_TOOL)?;
     let mut entities: Vec<Json> = Vec::new();

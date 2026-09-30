@@ -88,7 +88,7 @@ pub fn execute(client: &mut Client, intent: &str, payload: &Json) -> Result<Json
         let prepared = resolver::prepare_action(client, payload)?;
         return execute_hamcp_action(client, intent, payload, &prepared);
     }
-    let mut discovery = ToolDiscovery::new(None);
+    let mut discovery = ToolDiscovery::for_endpoint(client.config.mcp_url.as_deref());
     let tool = match discovery.get_tool(client, intent) {
         Ok(tool) => tool,
         Err(err) => {
@@ -144,7 +144,7 @@ fn execute_hamcp_get_state(client: &mut Client, payload: &Json) -> Result<Json, 
 /// Кэш схем и stale-refresh разрешены: ha_get_state — read-only, повторный
 /// вызов не может выполнить действие дважды.
 fn read_states_for_targets(client: &mut Client, entities: &[Entity]) -> Result<Json, HaCliError> {
-    let mut discovery = ToolDiscovery::new(None);
+    let mut discovery = ToolDiscovery::for_endpoint(client.config.mcp_url.as_deref());
     let tool = discovery.get_tool(client, HA_GET_STATE_TOOL)?;
     let mut states = Vec::new();
     let mut speech_parts = Vec::new();
@@ -282,7 +282,7 @@ fn execute_hamcp_action(
     let plan = service_plan(intent, payload, &entities[0])?;
     // Поиск инструмента до первого вызова; кэш схем — только read-only
     // discovery, повторной отправки действия он не вызывает.
-    let mut discovery = ToolDiscovery::new(None);
+    let mut discovery = ToolDiscovery::for_endpoint(client.config.mcp_url.as_deref());
     let tool = discovery.get_tool(client, HA_CALL_SERVICE_TOOL)?;
     for (performed, entity) in entities.iter().enumerate() {
         // Имя домена для TurnOn/Off — домен самой цели (проверен
