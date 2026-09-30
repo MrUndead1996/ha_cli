@@ -21,6 +21,7 @@ usage() {
 	echo "usage: install.sh [--skills-root PATH]" >&2
 }
 
+ORIG_ARGS=("$@")
 SKILLS_ROOT=""
 SKILLS_ROOT_GIVEN=0
 while [ $# -gt 0 ]; do
@@ -53,22 +54,42 @@ if [ "$SKILLS_ROOT_GIVEN" -eq 1 ] && [ -z "$SKILLS_ROOT" ]; then
 	exit 2
 fi
 
-SCRIPT_SOURCE="${BASH_SOURCE[0]}"
-while [ -L "$SCRIPT_SOURCE" ]; do
-	SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
-	SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
-	[ "${SCRIPT_SOURCE#/}" != "$SCRIPT_SOURCE" ] || SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_SOURCE"
-done
-REPO_ROOT="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
-
-BIN_DIR="$HOME/.local/bin"
-BIN_NAME="ha"
-SKILL_NAME="ha-control"
-
 log() { printf 'install.sh: %s\n' "$*"; }
 die() { printf 'install.sh: error: %s\n' "$*" >&2; exit 1; }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+
+# При `bash -s` (чтение из пайпа) BASH_SOURCE пуст — под set -u проверяем
+# существование элемента, а не его значение.
+if [ "${BASH_SOURCE[0]+set}" = set ] && [ -n "${BASH_SOURCE[0]}" ]; then
+	SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+	while [ -L "$SCRIPT_SOURCE" ]; do
+		SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+		SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
+		[ "${SCRIPT_SOURCE#/}" != "$SCRIPT_SOURCE" ] || SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_SOURCE"
+	done
+	ROOT_CANDIDATE="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+else
+	# `curl ... | bash`: скрипт читается из stdin, репозитория рядом нет.
+	ROOT_CANDIDATE=""
+fi
+
+# Self-bootstrap: при запуске из пайпа клонируем репозиторий во временную
+# директорию и перепоручаем установку клонированному install.sh.
+if [ -z "$ROOT_CANDIDATE" ] || [ ! -f "$ROOT_CANDIDATE/Cargo.toml" ]; then
+	need_cmd git
+	BOOTSTRAP_DIR="$(mktemp -d)"
+	log "bootstrapping: cloning repository into $BOOTSTRAP_DIR"
+	git clone -q --depth 1 https://github.com/MrUndead1996/ha_cli.git "$BOOTSTRAP_DIR/ha_cli" ||
+		die "cannot clone repository"
+	# "$@" уже разобран (и съеден shift) выше — передаём копию.
+	exec "$BOOTSTRAP_DIR/ha_cli/install.sh" "${ORIG_ARGS[@]}"
+fi
+REPO_ROOT="$ROOT_CANDIDATE"
+
+BIN_DIR="$HOME/.local/bin"
+BIN_NAME="ha"
+SKILL_NAME="ha-control"
 
 need_cmd cargo
 need_cmd install
