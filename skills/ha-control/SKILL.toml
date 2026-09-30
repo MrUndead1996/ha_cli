@@ -1,0 +1,16 @@
+# Манифест скилла OpenClaw. Обрабатывается инсталлятором
+# (install.sh --skills-root PATH), не самим OpenClaw: агент читает
+# только SKILL.md рядом с этим файлом.
+schema = "openclaw-skill/v1"
+
+[skill]
+name = "ha-control"
+version = "0.1.0"
+description = "Управляй устройствами Home Assistant через локальный CLI ha: включай и выключай свет и технику, спрашивай состояние сущностей по имени области, домену или имени устройства."
+
+[install]
+# Файлы, которые инсталлятор копирует в <SKILLS_ROOT>/ha-control/.
+# Плейсхолдер {{HA_BIN}} в SKILL.md заменяется на shell-экранированный
+# абсолютный путь к установленному бинарнику CLI.
+files = ["SKILL.md", "SKILL.toml"]
+template = "SKILL.md"

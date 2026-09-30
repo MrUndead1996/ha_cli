@@ -95,8 +95,8 @@ MCP over HTTP JSON-RPC (`/api/mcp/assist`, protocolVersion `2025-03-26`).
 
 - [x] CI: `cargo fmt --check && cargo clippy -- -D warnings && cargo test` (.github/workflows/ci.yml)
 - [x] Release-сборка (`panic=abort`, LTO, strip) + артефакты x86_64/aarch64-linux-musl (.github/workflows/release.yml, теги `v*`; aarch64 — основная архитектура, собирается нативно на ubuntu-24.04-arm)
-- [ ] Обновить `deploy-nanobot.sh` в nanobot_workspace: скачивание tar.gz с релизов вместо pip-установки (после первого тега)
-- [ ] README репозитория: секция установки из релизов, пометить Python-версию как legacy
+- [x] Скилл OpenClaw `ha-control` (skills/ha-control/SKILL.md + SKILL.toml) и install.sh с `--skills-root` (сборка, установка бинарника в ~/.local/bin, подстановка `{{HA_BIN}}`, откат при сбое) — заменяет deploy-nanobot.sh
+- [ ] README репозитория: секция установки из релизов и скилла, пометить Python-версию как legacy
 
 ## Отличия, требующие внимания
 
