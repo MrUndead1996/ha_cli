@@ -102,6 +102,7 @@ fn make_client(transport: FakeTransport) -> Client {
     let config = Config {
         url: Some("http://ha.test:8123".to_string()),
         mcp_url: None,
+        mcp_auth: Default::default(),
         token: "test-token".to_string(),
         timeout: 5,
     };

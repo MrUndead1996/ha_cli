@@ -86,6 +86,7 @@ fn fake_client(responses: Vec<Json>) -> (Client, MockTransport) {
     let config = Config {
         url: Some("http://ha.test:8123".to_string()),
         mcp_url: None,
+        mcp_auth: Default::default(),
         token: String::new(),
         timeout: 5,
     };

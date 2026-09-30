@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, McpAuth};
 use crate::errors::{ErrorType, HaCliError};
 use crate::security::Secrets;
 use serde_json::{json, Value as Json};
@@ -74,6 +74,11 @@ impl Client {
 
     fn extra_headers(&self) -> Vec<(String, String)> {
         let mut headers = Vec::new();
+        // Bearer передаётся как заголовок запроса (а не default_headers),
+        // чтобы подменный транспорт в тестах видел фактическую авторизацию.
+        if let Some(auth) = auth_header(&self.config) {
+            headers.push(("Authorization".to_string(), auth));
+        }
         if let Some(sid) = &self.session_id {
             headers.push(("Mcp-Session-Id".to_string(), sid.clone()));
         }
@@ -228,15 +233,6 @@ pub struct HttpTransport {
 impl HttpTransport {
     pub fn new(config: &Config) -> Result<Self, HaCliError> {
         let mut headers = reqwest::header::HeaderMap::new();
-        // HA_TOKEN не отправляется на другой адрес: секретный URL
-        // авторизуется сам по себе.
-        if let Some(auth) = auth_header(config) {
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_str(&auth)
-                    .map_err(|e| HaCliError::new(ErrorType::Configuration, e.to_string()))?,
-            );
-        }
         headers.insert(
             reqwest::header::CONTENT_TYPE,
             reqwest::header::HeaderValue::from_static("application/json"),
@@ -254,13 +250,21 @@ impl HttpTransport {
     }
 }
 
-/// Bearer `HA_TOKEN` только для прежнего Assist endpoint; секретный URL
-/// авторизуется сам по себе и токен по умолчанию не получает.
+/// Авторизация запроса:
+/// - Assist endpoint (`mcp_url` не задан) — Bearer `HA_TOKEN` как раньше;
+/// - `HA_MCP_URL` без `mcp_auth=ha_auth` — токен не отправляется,
+///   секретный URL авторизуется сам по себе;
+/// - `HA_MCP_URL` с явным `mcp_auth=ha_auth` — Bearer `HA_TOKEN`.
 pub fn auth_header(config: &Config) -> Option<String> {
-    if config.mcp_url.is_some() || config.token.is_empty() {
-        None
-    } else {
-        Some(format!("Bearer {}", config.token))
+    if config.token.is_empty() {
+        return None;
+    }
+    match config.mcp_url {
+        Some(_) => match config.mcp_auth {
+            McpAuth::HaAuth => Some(format!("Bearer {}", config.token)),
+            McpAuth::None => None,
+        },
+        None => Some(format!("Bearer {}", config.token)),
     }
 }
 
@@ -271,8 +275,9 @@ impl Transport for HttpTransport {
         payload: &Json,
         headers: &[(String, String)],
     ) -> Result<HttpResponse, HaCliError> {
-        let full_url = format!("{}{}", url.trim_end_matches('/'), ASSIST_MCP_ENDPOINT);
-        let mut request = self.http.post(&full_url).json(payload);
+        // Endpoint уже разрешён вызывающей стороной (resolve_endpoint):
+        // настроенный mcp_url используется как есть, без добавления пути Assist.
+        let mut request = self.http.post(url).json(payload);
         for (name, value) in headers {
             request = request.header(name, value);
         }
@@ -303,5 +308,183 @@ impl Transport for HttpTransport {
             headers: resp_headers,
             body,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::security::Secrets;
+    use std::cell::RefCell;
+
+    type RecordedRequest = (String, Json, Vec<(String, String)>);
+
+    struct RecordingTransport {
+        requests: RefCell<Vec<RecordedRequest>>,
+        response: HttpResponse,
+    }
+
+    impl RecordingTransport {
+        fn new() -> Self {
+            Self {
+                requests: RefCell::new(Vec::new()),
+                response: HttpResponse {
+                    status: 200,
+                    headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                    body: json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string(),
+                },
+            }
+        }
+
+        fn authorization(&self) -> Option<String> {
+            self.requests.borrow().first().and_then(|(_, _, headers)| {
+                headers
+                    .iter()
+                    .find(|(k, _)| k == "Authorization")
+                    .map(|(_, v)| v.clone())
+            })
+        }
+
+        fn last_url(&self) -> String {
+            self.requests.borrow().first().unwrap().0.clone()
+        }
+    }
+
+    impl Transport for RecordingTransport {
+        fn post(
+            &mut self,
+            url: &str,
+            payload: &Json,
+            headers: &[(String, String)],
+        ) -> Result<HttpResponse, HaCliError> {
+            self.requests
+                .borrow_mut()
+                .push((url.to_string(), payload.clone(), headers.to_vec()));
+            Ok(HttpResponse {
+                status: self.response.status,
+                headers: self.response.headers.clone(),
+                body: self.response.body.clone(),
+            })
+        }
+    }
+
+    /// Обёртка, позволяющая инспектировать запросы после передачи транспорта
+    /// в Client (Box<dyn Transport> забирает владение).
+    #[derive(Clone)]
+    struct SharedTransport(std::rc::Rc<std::cell::RefCell<RecordingTransport>>);
+
+    impl SharedTransport {
+        fn new() -> Self {
+            Self(std::rc::Rc::new(std::cell::RefCell::new(
+                RecordingTransport::new(),
+            )))
+        }
+
+        fn authorization(&self) -> Option<String> {
+            self.0.borrow().authorization()
+        }
+
+        fn last_url(&self) -> String {
+            self.0.borrow().last_url()
+        }
+    }
+
+    impl Transport for SharedTransport {
+        fn post(
+            &mut self,
+            url: &str,
+            payload: &Json,
+            headers: &[(String, String)],
+        ) -> Result<HttpResponse, HaCliError> {
+            self.0.borrow_mut().post(url, payload, headers)
+        }
+    }
+
+    fn config_from(mcp_url: Option<&str>, mcp_auth: McpAuth, token: &str) -> Config {
+        Config {
+            url: Some("http://ha.local".to_string()),
+            mcp_url: mcp_url.map(str::to_string),
+            mcp_auth,
+            token: token.to_string(),
+            timeout: 5,
+        }
+    }
+
+    #[test]
+    fn mcp_url_default_sends_no_bearer() {
+        let config = config_from(
+            Some("http://ha.local/api/webhook/sec"),
+            McpAuth::None,
+            "tok",
+        );
+        assert_eq!(auth_header(&config), None);
+    }
+
+    #[test]
+    fn mcp_url_ha_auth_sends_bearer() {
+        let config = config_from(
+            Some("http://ha.local/api/webhook/sec"),
+            McpAuth::HaAuth,
+            "tok",
+        );
+        assert_eq!(auth_header(&config), Some("Bearer tok".to_string()));
+    }
+
+    #[test]
+    fn assist_endpoint_keeps_bearer() {
+        let config = config_from(None, McpAuth::None, "tok");
+        assert_eq!(auth_header(&config), Some("Bearer tok".to_string()));
+    }
+
+    #[test]
+    fn empty_token_never_authorizes() {
+        let config = config_from(None, McpAuth::None, "");
+        assert_eq!(auth_header(&config), None);
+    }
+
+    #[test]
+    fn request_to_mcp_url_has_no_authorization_by_default() {
+        let config = config_from(
+            Some("http://ha.local/api/webhook/sec"),
+            McpAuth::None,
+            "tok",
+        );
+        let transport = SharedTransport::new();
+        let mut client = Client::new(config, Box::new(transport.clone()), &Secrets::new());
+        client.initialize().unwrap();
+        assert_eq!(transport.authorization(), None);
+        assert_eq!(transport.last_url(), "http://ha.local/api/webhook/sec");
+    }
+
+    #[test]
+    fn request_to_mcp_url_with_ha_auth_sends_authorization() {
+        let config = config_from(
+            Some("http://ha.local/api/webhook/sec"),
+            McpAuth::HaAuth,
+            "tok",
+        );
+        let transport = SharedTransport::new();
+        let mut client = Client::new(config, Box::new(transport.clone()), &Secrets::new());
+        client.initialize().unwrap();
+        assert_eq!(transport.authorization(), Some("Bearer tok".to_string()));
+    }
+
+    #[test]
+    fn assist_request_keeps_authorization_and_endpoint() {
+        let config = config_from(None, McpAuth::None, "tok");
+        let transport = SharedTransport::new();
+        let mut client = Client::new(config, Box::new(transport.clone()), &Secrets::new());
+        client.initialize().unwrap();
+        assert_eq!(transport.authorization(), Some("Bearer tok".to_string()));
+        assert_eq!(transport.last_url(), "http://ha.local/api/mcp/assist");
+    }
+
+    #[test]
+    fn mcp_url_is_not_suffixed_with_assist_path() {
+        let config = config_from(Some("http://ha.local/private_secret"), McpAuth::None, "tok");
+        let transport = SharedTransport::new();
+        let mut client = Client::new(config, Box::new(transport.clone()), &Secrets::new());
+        client.initialize().unwrap();
+        assert_eq!(transport.last_url(), "http://ha.local/private_secret");
     }
 }

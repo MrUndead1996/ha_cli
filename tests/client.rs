@@ -93,6 +93,7 @@ fn make_client(transport: MockTransport) -> Client {
         Config {
             url: Some("http://ha.test:8123".to_string()),
             mcp_url: None,
+            mcp_auth: Default::default(),
             token: "secret".to_string(),
             timeout: 5,
         },
@@ -218,6 +219,7 @@ fn connection_error_from_transport() {
         Config {
             url: Some("http://ha.test:8123".to_string()),
             mcp_url: None,
+            mcp_auth: Default::default(),
             token: "secret".to_string(),
             timeout: 5,
         },
@@ -399,6 +401,7 @@ fn mcp_url_used_as_is_webhook() {
         Config {
             url: Some("http://ha.test:8123".to_string()),
             mcp_url: Some("http://ha.test:8123/api/webhook/wh_secret123".to_string()),
+            mcp_auth: Default::default(),
             token: String::new(),
             timeout: 5,
         },
@@ -422,6 +425,7 @@ fn mcp_url_used_as_is_direct_private_path() {
         Config {
             url: Some("http://ha.test:8123".to_string()),
             mcp_url: Some("http://127.0.0.1:8123/private_prv_secret456".to_string()),
+            mcp_auth: Default::default(),
             token: String::new(),
             timeout: 5,
         },
@@ -454,6 +458,7 @@ fn secret_mcp_url_redacted_in_transport_error() {
         Config {
             url: Some("http://ha.test:8123".to_string()),
             mcp_url: Some(mcp_url),
+            mcp_auth: Default::default(),
             token: String::new(),
             timeout: 5,
         },
@@ -470,6 +475,7 @@ fn auth_header_only_for_assist_endpoint() {
     let assist = Config {
         url: Some("http://ha.test:8123".to_string()),
         mcp_url: None,
+        mcp_auth: Default::default(),
         token: "ha-token".to_string(),
         timeout: 5,
     };
@@ -481,6 +487,7 @@ fn auth_header_only_for_assist_endpoint() {
     let webhook = Config {
         url: Some("http://ha.test:8123".to_string()),
         mcp_url: Some("http://ha.test:8123/api/webhook/wh_s".to_string()),
+        mcp_auth: Default::default(),
         token: "ha-token".to_string(),
         timeout: 5,
     };
@@ -489,4 +496,16 @@ fn auth_header_only_for_assist_endpoint() {
         resolve_endpoint(&webhook),
         "http://ha.test:8123/api/webhook/wh_s"
     );
+}
+
+#[test]
+fn auth_header_ha_auth_opt_in_sends_token_to_mcp_url() {
+    let webhook = Config {
+        url: Some("http://ha.test:8123".to_string()),
+        mcp_url: Some("http://ha.test:8123/api/webhook/wh_s".to_string()),
+        mcp_auth: ha_cli::config::McpAuth::HaAuth,
+        token: "ha-token".to_string(),
+        timeout: 5,
+    };
+    assert_eq!(auth_header(&webhook), Some("Bearer ha-token".to_string()));
 }
