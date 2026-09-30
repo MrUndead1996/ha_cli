@@ -60,12 +60,12 @@ MCP over HTTP JSON-RPC (`/api/mcp/assist`, protocolVersion `2025-03-26`).
 - [x] `cli.rs` — clap-схема, скелет диспетчера
 - [x] `docs/migration.md`
 
-### Phase 1 — config + client
+### Phase 1 — config + client (готово)
 
-- [ ] `config.rs`: разбор TOML, env, приоритеты, проверки прав (тесты `test_config.py` → `tests/config.rs`)
-- [ ] `security.rs`: `read_token_file` (O_NOFOLLOW/O_NONBLOCK через `std::os::unix::fs::OpenOptionsExt`), `require_secure_mode`
-- [ ] `client.rs`: `HttpTransport` на reqwest (rustls), таймауты, маппинг 401/403 → `AuthenticationError`, capture `Mcp-Session-Id`/`Mcp-Protocol-Version`, `initialize` → `tools_list` → `tools/call`
-- [ ] Тесты с мок-транспортом (аналог `test_client.py`, включая случай stale-session)
+- [x] `config.rs`: разбор TOML, env, приоритеты, проверки прав (тесты `test_config.py` → `tests/config.rs`)
+- [x] `security.rs`: `read_token_file` (O_NOFOLLOW/O_NONBLOCK через `std::os::unix::fs::OpenOptionsExt`), `require_secure_mode`
+- [x] `client.rs`: `HttpTransport` на reqwest (rustls), таймауты, маппинг 401/403 → `AuthenticationError`, capture `Mcp-Session-Id`/`Mcp-Protocol-Version`, `initialize` → `tools_list` → `tools/call`
+- [x] Тесты с мок-транспортом (аналог `test_client.py`, включая случай stale-session)
 
 ### Phase 2 — discovery
 

@@ -23,7 +23,10 @@ impl Entity {
             _ => "unknown".to_string(),
         };
         let aliases = split_aliases(obj.get("area"));
-        let area = aliases.first().cloned().unwrap_or_else(|| "Unknown".to_string());
+        let area = aliases
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "Unknown".to_string());
         let state = obj
             .get("state")
             .and_then(Json::as_str)
