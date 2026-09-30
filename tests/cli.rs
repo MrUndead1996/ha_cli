@@ -558,3 +558,27 @@ fn error_output_redacts_token() {
     assert!(!redacted.contains("test-token"));
     assert!(redacted.contains("[REDACTED]"));
 }
+
+#[test]
+fn intent_tool_error_with_reflected_secrets_is_redacted_in_error_json() {
+    // Сообщение ToolError, отражающее webhook URL и bearer токен, не
+    // должно попасть в stderr JSON без редактирования.
+    let webhook = "http://ha.local/api/webhook/wh_s3cret";
+    let result = json!({
+        "content": [{
+            "type": "text",
+            "text": format!("POST {webhook} failed: bearer ha_tok_123 invalid"),
+        }],
+        "isError": true,
+    });
+    let err = ha_cli::intents::normalize_result(&result).unwrap_err();
+    let mut secrets = Secrets::new();
+    secrets.register("ha_tok_123");
+    ha_cli::config::register_mcp_secrets(&mut secrets, webhook);
+    let rendered = secrets.redact(&err.to_json());
+    assert_eq!(err.kind.exit_code(), EXIT_INTENT_EXECUTION_ERROR);
+    assert!(!rendered.contains("wh_s3cret"));
+    assert!(!rendered.contains("/api/webhook/"));
+    assert!(!rendered.contains("ha_tok_123"));
+    assert!(rendered.contains("[REDACTED]"));
+}

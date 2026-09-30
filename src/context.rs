@@ -2,6 +2,7 @@ use crate::client::Client;
 use crate::discovery::{get_tool as find_tool, is_stale_tool_result, ToolDiscovery};
 use crate::errors::{ErrorType, HaCliError};
 use crate::models::Entity;
+use crate::tool_result::{extract_text, success_failure_message, tool_error_message, truthy};
 use serde_json::{json, Map, Value as Json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -67,21 +68,20 @@ pub fn parse_live_context(result: &Json) -> Result<Json, HaCliError> {
     if !result.is_object() {
         return Err(context_error("unexpected tool result type"));
     }
-    if !result.get("content").is_some_and(Json::is_array) {
-        return Err(context_error("tool result has no content"));
-    }
+    // Ошибки инструмента проверяются ДО требования content: структурированная
+    // ToolError при `isError` без content — настоящая ошибка, а не «нет content».
     if truthy(result.get("isError")) {
-        let text = extract_text(result);
-        let message = if text.is_empty() {
-            "context request failed"
-        } else {
-            &text
-        };
-        return Err(context_error(message));
+        return Err(context_error(&tool_error_message(
+            result,
+            "context request failed",
+        )));
     }
     let structured = match result.get("structuredContent") {
         Some(value) if !value.is_null() => value,
         _ => {
+            if !result.get("content").is_some_and(Json::is_array) {
+                return Err(context_error("tool result has no content"));
+            }
             let text = extract_text(result);
             if text.is_empty() {
                 return Err(context_error("tool result has no text content"));
@@ -94,6 +94,9 @@ pub fn parse_live_context(result: &Json) -> Result<Json, HaCliError> {
             return unwrap_live_context(&parsed);
         }
     };
+    if let Some(message) = success_failure_message(structured, "GetLiveContext reported failure") {
+        return Err(context_error(&message));
+    }
     if !structured.is_object() {
         return Err(context_error("structuredContent is not a JSON object"));
     }
@@ -255,16 +258,19 @@ fn with_ok(data: &Json) -> Json {
     Json::Object(merged)
 }
 
-/// Перенос `_unwrap_live_context`.
+/// Перенос `_unwrap_live_context`. Legacy-конверт `{success, result}`:
+/// `success:false` (с `result` или без) — ошибка, при этом `success:true`
+/// распаковывается как раньше.
 fn unwrap_live_context(parsed: &Json) -> Result<Json, HaCliError> {
     let context_error = |message: &str| HaCliError::new(ErrorType::Context, message.to_string());
-    let (Some(success), Some(result)) = (parsed.get("success"), parsed.get("result")) else {
-        return Ok(parsed.clone());
-    };
-    if !matches!(success, Json::Bool(true)) {
-        return Err(context_error("GetLiveContext reported failure"));
+    if let Some(message) = success_failure_message(parsed, "GetLiveContext reported failure") {
+        return Err(context_error(&message));
     }
-    let Some(text) = result.as_str() else {
+    // Прежний контракт: объект без success или result — payload как есть.
+    if parsed.get("success").is_none() || parsed.get("result").is_none() {
+        return Ok(parsed.clone());
+    }
+    let Some(text) = parsed.get("result").and_then(Json::as_str) else {
         return Err(context_error("GetLiveContext result is not text"));
     };
     let entities = parse_context_entities(text)?;
@@ -374,22 +380,6 @@ fn split_field(line: &str) -> Result<(String, String), HaCliError> {
     Ok((key.to_string(), value.to_string()))
 }
 
-/// Перенос `_extract_text`.
-fn extract_text(result: &Json) -> String {
-    let Some(content) = result.get("content").and_then(Json::as_array) else {
-        return String::new();
-    };
-    for item in content {
-        if item.get("type").and_then(Json::as_str) == Some("text") {
-            return match item.get("text") {
-                Some(Json::String(text)) => text.clone(),
-                _ => String::new(),
-            };
-        }
-    }
-    String::new()
-}
-
 /// Семантические селекторы target (аналог dict selectors в Python).
 struct Selectors<'a> {
     area: Option<&'a str>,
@@ -427,18 +417,6 @@ fn equals_any(value: &str, candidates: &[&str]) -> bool {
     candidates
         .iter()
         .any(|candidate| candidate.trim().to_lowercase() == expected)
-}
-
-/// Аналог Python-проверки истинности для `result.get("isError")`.
-fn truthy(value: Option<&Json>) -> bool {
-    match value {
-        None | Some(Json::Null) => false,
-        Some(Json::Bool(flag)) => *flag,
-        Some(Json::Number(number)) => number.as_f64().is_none_or(|f| f != 0.0),
-        Some(Json::String(text)) => !text.is_empty(),
-        Some(Json::Array(items)) => !items.is_empty(),
-        Some(Json::Object(object)) => !object.is_empty(),
-    }
 }
 
 #[cfg(test)]

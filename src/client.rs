@@ -163,6 +163,9 @@ impl Client {
                 .get("message")
                 .and_then(Json::as_str)
                 .unwrap_or("unknown MCP error");
+            // Сообщение сервера может отражать webhook URL или токен:
+            // редактируем секреты до формирования ошибки.
+            let message = self.secrets.redact(message);
             return Err(HaCliError::new(
                 ErrorType::HaApi,
                 format!("MCP error: {message}"),

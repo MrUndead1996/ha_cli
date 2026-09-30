@@ -894,3 +894,114 @@ fn query_state_matches_multiple_entities() {
     assert_eq!(result["speech"], json!("A: on"));
     assert_eq!(result["data"]["states"].as_array().unwrap().len(), 1);
 }
+
+// ---------- 2.4: ошибки без content и structured success:false ----------
+
+#[test]
+fn parse_is_error_without_content_uses_structured_tool_error() {
+    let err = context::parse_live_context(&json!({
+        "isError": true,
+        "structuredContent": {"error": "agent unavailable"},
+    }))
+    .unwrap_err();
+    assert_eq!(err.kind.as_str(), ErrorType::Context.as_str());
+    assert_eq!(err.message, "agent unavailable");
+}
+
+#[test]
+fn parse_is_error_without_content_and_structured_keeps_default_message() {
+    let err = context::parse_live_context(&json!({"isError": true})).unwrap_err();
+    assert_eq!(err.message, "context request failed");
+}
+
+#[test]
+fn parse_structured_success_false_is_context_error() {
+    let err = context::parse_live_context(&json!({
+        "content": [],
+        "isError": false,
+        "structuredContent": {"success": false, "error": "context refused"},
+    }))
+    .unwrap_err();
+    assert_eq!(err.kind.as_str(), ErrorType::Context.as_str());
+    assert_eq!(err.message, "context refused");
+}
+
+#[test]
+fn parse_structured_success_false_without_error_has_default_message() {
+    let err = context::parse_live_context(&json!({
+        "content": [],
+        "isError": false,
+        "structuredContent": {"success": false},
+    }))
+    .unwrap_err();
+    assert_eq!(err.message, "GetLiveContext reported failure");
+}
+
+#[test]
+fn parse_structured_success_true_is_success() {
+    let parsed = context::parse_live_context(&json!({
+        "content": [],
+        "isError": false,
+        "structuredContent": {"success": true, "entities": [{"name": "A"}]},
+    }))
+    .unwrap();
+    assert_eq!(parsed["entities"][0]["name"], json!("A"));
+}
+
+#[test]
+fn parse_text_success_false_without_result_is_context_error() {
+    let err = context::parse_live_context(&json!({
+        "content": [{"type": "text", "text": r#"{"success": false, "error": "boom"}"#}],
+        "isError": false,
+    }))
+    .unwrap_err();
+    assert_eq!(err.kind.as_str(), ErrorType::Context.as_str());
+    assert_eq!(err.message, "boom");
+}
+
+#[test]
+fn parse_text_success_false_with_result_still_fails() {
+    let result = context::parse_live_context(&json!({
+        "content": [{"type": "text", "text": r#"{"success": false, "result": "failed"}"#}],
+        "isError": false,
+    }));
+    assert_eq!(
+        result.unwrap_err().message,
+        "GetLiveContext reported failure"
+    );
+}
+
+#[test]
+fn parse_legacy_success_true_envelope_still_unwraps() {
+    let parsed = context::parse_live_context(&json!({
+        "content": [{
+            "type": "text",
+            "text": r#"{"success": true, "result": "Live Context:\n- names: lamp\n  domain: light"}"#,
+        }],
+        "isError": false,
+    }))
+    .unwrap();
+    assert_eq!(parsed["entities"][0]["name"], json!("lamp"));
+}
+
+#[test]
+fn parse_result_without_success_is_returned_as_is() {
+    // Регрессия: конверт с result, но без success — payload как есть,
+    // без попытки парсить "Live Context:".
+    let parsed = context::parse_live_context(&json!({
+        "content": [{"type": "text", "text": r#"{"result": "raw payload"}"#}],
+        "isError": false,
+    }))
+    .unwrap();
+    assert_eq!(parsed, json!({"result": "raw payload"}));
+}
+
+#[test]
+fn parse_success_without_result_is_returned_as_is() {
+    let parsed = context::parse_live_context(&json!({
+        "content": [{"type": "text", "text": r#"{"success": true, "entities": []}"#}],
+        "isError": false,
+    }))
+    .unwrap();
+    assert_eq!(parsed, json!({"success": true, "entities": []}));
+}

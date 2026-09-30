@@ -517,3 +517,78 @@ fn auth_header_ha_auth_opt_in_sends_token_to_mcp_url() {
     };
     assert_eq!(auth_header(&webhook), Some("Bearer ha-token".to_string()));
 }
+
+// --- 2.4: различение JSON-RPC ошибки и redaction отражённых секретов ---
+
+fn json_rpc_error(message: &str) -> Resp {
+    json_response(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": -32000, "message": message},
+    }))
+}
+
+#[test]
+fn json_rpc_error_message_is_redacted() {
+    let webhook = "http://ha.local/api/webhook/wh_s3cret";
+    let transport = MockTransport::new(move |_payload, _headers| {
+        json_rpc_error(&format!("POST {webhook} failed for bearer sk_live_token"))
+    });
+    let config = Config {
+        url: Some("http://ha.test:8123".to_string()),
+        mcp_url: Some(webhook.to_string()),
+        mcp_auth: Default::default(),
+        token: String::new(),
+        timeout: 5,
+        connect_timeout: 5,
+    };
+    let mut secrets = ha_cli::security::Secrets::new();
+    secrets.register("sk_live_token");
+    ha_cli::config::register_mcp_secrets(&mut secrets, webhook);
+    let mut client = Client::new(config, Box::new(transport), &secrets);
+    let err = client.call("tools/list", None).unwrap_err();
+    assert_eq!(err.kind.as_str(), ErrorType::HaApi.as_str());
+    let rendered = secrets.redact(&err.to_json());
+    assert!(!rendered.contains("wh_s3cret"));
+    assert!(!rendered.contains("/api/webhook/"));
+    assert!(!rendered.contains("sk_live_token"));
+    assert!(rendered.contains("[REDACTED]"));
+}
+
+#[test]
+fn json_rpc_error_over_sse_is_ha_api_error_and_redacted() {
+    let message = "call failed near /private_s3cret with token sk_live_token";
+    let transport = MockTransport::new(move |payload, _headers| {
+        let body = format!(
+            "event: message\ndata: {}\n\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "error": {"code": -32000, "message": message},
+            })
+        );
+        (
+            200,
+            vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+            body,
+        )
+    });
+    let mut secrets = Secrets::new();
+    secrets.register("sk_live_token");
+    ha_cli::config::register_mcp_secrets(&mut secrets, "http://ha.local/private_s3cret");
+    let config = Config {
+        url: Some("http://ha.test:8123".to_string()),
+        mcp_url: Some("http://ha.local/private_s3cret".to_string()),
+        mcp_auth: Default::default(),
+        token: String::new(),
+        timeout: 5,
+        connect_timeout: 5,
+    };
+    let mut client = Client::new(config, Box::new(transport), &secrets);
+    let err = client.call("tools/call", Some(&json!({}))).unwrap_err();
+    assert_eq!(err.kind.as_str(), ErrorType::HaApi.as_str());
+    let rendered = secrets.redact(&err.to_json());
+    assert!(!rendered.contains("s3cret"));
+    assert!(!rendered.contains("sk_live_token"));
+    assert!(rendered.contains("[REDACTED]"));
+}

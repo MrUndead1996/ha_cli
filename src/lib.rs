@@ -8,3 +8,4 @@ pub mod intents;
 pub mod models;
 pub mod output;
 pub mod security;
+pub mod tool_result;

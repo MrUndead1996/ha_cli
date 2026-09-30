@@ -692,3 +692,184 @@ fn blocked_intent_names_cannot_reach_mcp() {
         assert_eq!(transport.tool_calls().len(), 0, "{name}");
     }
 }
+
+// --- 2.4: различение исходов tools/call ---
+
+#[test]
+fn normalize_is_error_uses_structured_tool_error_message() {
+    // Текст content пуст, сообщение ToolError в structuredContent.
+    let err = normalize_result(&json!({
+        "content": [],
+        "isError": true,
+        "structuredContent": {"error": "entity not exposed by ha-mcp"},
+    }))
+    .unwrap_err();
+    assert_eq!(err.kind.exit_code(), 7);
+    assert_eq!(err.message, "entity not exposed by ha-mcp");
+}
+
+#[test]
+fn normalize_is_error_structured_message_key() {
+    let err = normalize_result(&json!({
+        "content": [{"type": "text", "text": ""}],
+        "isError": true,
+        "structuredContent": {"message": "service call failed"},
+    }))
+    .unwrap_err();
+    assert_eq!(err.message, "service call failed");
+}
+
+#[test]
+fn normalize_is_error_prefers_content_text_over_structured() {
+    let err = normalize_result(&json!({
+        "content": [{"type": "text", "text": "light is unavailable"}],
+        "isError": true,
+        "structuredContent": {"error": "structured detail"},
+    }))
+    .unwrap_err();
+    assert_eq!(err.message, "light is unavailable");
+}
+
+#[test]
+fn normalize_success_false_in_structured_content_without_error() {
+    // success:false без content и без error — не успешный результат.
+    let err = normalize_result(&json!({
+        "content": [],
+        "isError": false,
+        "structuredContent": {"success": false},
+    }))
+    .unwrap_err();
+    assert_eq!(err.kind.exit_code(), 7);
+    assert_eq!(err.message, "tool reported failure");
+}
+
+#[test]
+fn normalize_success_false_in_structured_content_with_error() {
+    let err = normalize_result(&json!({
+        "content": [],
+        "isError": false,
+        "structuredContent": {"success": false, "error": "lamp refused the command"},
+    }))
+    .unwrap_err();
+    assert_eq!(err.kind.exit_code(), 7);
+    assert_eq!(err.message, "lamp refused the command");
+}
+
+#[test]
+fn normalize_success_false_in_text_with_content() {
+    let err = normalize_result(&tool_result(
+        r#"{"success": false, "error": "refused by ha-mcp"}"#,
+        false,
+        None,
+    ))
+    .unwrap_err();
+    assert_eq!(err.kind.exit_code(), 7);
+    assert_eq!(err.message, "refused by ha-mcp");
+}
+
+#[test]
+fn normalize_success_false_in_text_without_error_key() {
+    let err = normalize_result(&tool_result(r#"{"success": false}"#, false, None)).unwrap_err();
+    assert_eq!(err.kind.exit_code(), 7);
+    assert_eq!(err.message, "tool reported failure");
+}
+
+#[test]
+fn normalize_success_true_is_not_failure() {
+    let data = normalize_result(&tool_result(
+        r#"{"success": true, "result": "done"}"#,
+        false,
+        Some(json!({"success": true, "result": "done"})),
+    ))
+    .unwrap();
+    assert_eq!(data["ok"], json!(true));
+}
+
+#[test]
+fn normalize_nested_success_key_is_not_top_level_failure() {
+    // Assist-ответ: "success" внутри data — не признак неудачи инструмента.
+    let data = normalize_result(&tool_result(
+        r#"{"speech": "ok", "response_type": "action_done",
+            "data": {"success": [], "failed": []}}"#,
+        false,
+        None,
+    ))
+    .unwrap();
+    assert_eq!(data["ok"], json!(true));
+}
+
+#[test]
+fn tools_call_http_401_is_authentication_error_without_retry() {
+    let _cache = isolated_cache();
+    let transport = MockTransport::new(vec![json!({"name": "HassTurnOn"})]);
+    transport.push_call_result(401, default_call_result());
+    let mut client = make_client(&transport);
+
+    let err = execute(&mut client, "HassTurnOn", &json!({"area": "Kitchen"})).unwrap_err();
+
+    assert_eq!(err.kind.exit_code(), 4);
+    assert_eq!(transport.tool_calls().len(), 1);
+}
+
+#[test]
+fn tools_call_http_403_is_authentication_error_without_retry() {
+    let _cache = isolated_cache();
+    let transport = MockTransport::new(vec![json!({"name": "HassTurnOn"})]);
+    transport.push_call_result(403, default_call_result());
+    let mut client = make_client(&transport);
+
+    let err = execute(&mut client, "HassTurnOn", &json!({"area": "Kitchen"})).unwrap_err();
+
+    assert_eq!(err.kind.exit_code(), 4);
+    assert_eq!(transport.tool_calls().len(), 1);
+}
+
+#[test]
+fn tools_call_is_error_result_is_intent_error_without_retry() {
+    let _cache = isolated_cache();
+    let transport = MockTransport::new(vec![json!({"name": "HassTurnOn"})]);
+    transport.push_call_result(
+        200,
+        json!({
+            "content": [{"type": "text", "text": "Tool execution failed"}],
+            "isError": true,
+        }),
+    );
+    let mut client = make_client(&transport);
+
+    let err = execute(&mut client, "HassTurnOn", &json!({"area": "Kitchen"})).unwrap_err();
+
+    assert_eq!(err.kind.exit_code(), 7);
+    // Ошибка результата не трактуется как устаревшая схема: повторного
+    // вызова tools/call нет.
+    assert_eq!(transport.tool_calls().len(), 1);
+}
+
+#[test]
+fn normalize_is_error_without_content_uses_structured_tool_error() {
+    let err = normalize_result(&json!({
+        "isError": true,
+        "structuredContent": {"error": "service unavailable"},
+    }))
+    .unwrap_err();
+    assert_eq!(err.kind.exit_code(), 7);
+    assert_eq!(err.message, "service unavailable");
+}
+
+#[test]
+fn normalize_structured_success_false_without_content_is_intent_error() {
+    let err = normalize_result(&json!({
+        "isError": false,
+        "structuredContent": {"success": false, "error": "lamp refused"},
+    }))
+    .unwrap_err();
+    assert_eq!(err.kind.exit_code(), 7);
+    assert_eq!(err.message, "lamp refused");
+}
+
+#[test]
+fn normalize_normal_result_without_content_still_requires_content() {
+    // Обратная совместимость: не-ошибочный результат без content отклоняется.
+    let err = normalize_result(&json!({"isError": false})).unwrap_err();
+    assert_eq!(err.message, "tool result has no content");
+}

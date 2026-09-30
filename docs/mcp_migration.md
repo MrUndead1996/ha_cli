@@ -94,6 +94,21 @@ ha-mcp при поиске, применяется только внутри CLI
   и `{ "success": false, ... }` в результате; секреты не должны попадать в
   stderr даже при ответе сервера с отражённым URL.
 
+Реализовано (этап 2.4): HTTP 401/403 различимы как `authentication_error`
+(exit 4), прочие HTTP >=400 и JSON-RPC `error` — `ha_api_error` (exit 6,
+сообщение сервера проходит `Secrets.redact`); `tools/call` с `isError=true`
+(текст content либо структурированное сообщение ToolError
+`structuredContent.error`/`.message`) и `{ "success": false, ... }` внутри
+`structuredContent` или JSON в тексте content — `intent_failed` (exit 7),
+такие результаты никогда не выдаются как успешные. Те же проверки применены
+в `parse_live_context` (`context_error`, exit 10) до требования наличия
+content; legacy-конверт GetLiveContext `{success, result}` при `success:true`
+распаковывается как раньше. Общие хелперы вынесены в `src/tool_result.rs`. Финальный JSON ошибки
+на stderr и debug-трассировка проходят `Secrets.redact`: отражённый webhook
+URL, часть path, секретный сегмент и токен редактируются. Повторный вызов
+инструмента после отправки действия не выполняется (ошибки чтения после
+отправки помечаются «may still have been performed»).
+
 Реализовано (этап 2.2): выбранная схема авторизации — `HA_MCP_AUTH=ha_auth`
 (TOML `mcp_auth="ha_auth"`) как явный opt-in на отправку `HA_TOKEN` Bearer
 на `HA_MCP_URL`; по умолчанию `none` — секретный URL авторизуется сам,
