@@ -46,6 +46,13 @@ pub fn execute(client: &mut Client, intent: &str, payload: &Json) -> Result<Json
     // путь исполнения (ha_call_service) появится на этапе 4.
     // Assist endpoint без `mcp_url` работает как раньше.
     if client.config.mcp_url.is_some() {
+        // Этап 4.1: строгая интент-специфичная валидация payload
+        // (allowlist ключей, типы, диапазоны, сочетания, домен по
+        // селектору) — ДО любых сетевых вызовов, включая
+        // `resolver::prepare_action` и `ha_get_state`.
+        if let Err(message) = security::validate_intent_payload(intent, payload) {
+            return Err(HaCliError::new(ErrorType::InvalidArguments, message));
+        }
         if intent == "HassGetState" {
             return execute_hamcp_get_state(client, payload);
         }
@@ -392,6 +399,62 @@ mod tests {
         // Транспорт не вызывается: селекторы проверяются до сети.
         let err = execute(&mut client, "HassTurnOn", &json!({})).unwrap_err();
         assert!(matches!(err.kind, ErrorType::InvalidArguments));
+    }
+
+    #[test]
+    fn strict_intent_payload_validation_rejects_before_any_request() {
+        // Этап 4.1: неизвестные ключи, плохие типы/диапазоны и недопустимые
+        // сочетания отклоняются ДО сети (NoNetwork паникует при любом
+        // запросе), включая prepare_action и ha_get_state.
+        let mut client = mcp_client();
+        for (intent, payload) in [
+            (
+                "HassLightSet",
+                json!({"area": "kitchen", "brightness": 101}),
+            ),
+            // Дробный литерал — другой JSON-тип, отклоняется до сети.
+            (
+                "HassLightSet",
+                json!({"area": "kitchen", "brightness": 50.0}),
+            ),
+            (
+                "HassSetPosition",
+                json!({"area": "kitchen", "position": 70.0}),
+            ),
+            (
+                "HassLightSet",
+                json!({"name": "Lamp", "color_temp_kelvin": "3000"}),
+            ),
+            (
+                "HassLightSet",
+                json!({"area": "kitchen", "color_temp_kelvin": 3000, "rgb_color": [1, 2, 3]}),
+            ),
+            (
+                "HassLightSet",
+                json!({"area": "kitchen", "domain": "switch"}),
+            ),
+            (
+                "HassLightSet",
+                json!({"area": "kitchen", "data": {"brightness": 50}}),
+            ),
+            (
+                "HassSetPosition",
+                json!({"area": "kitchen", "position": 150}),
+            ),
+            ("HassSetPosition", json!({"name": "Blinds"})),
+            ("HassTurnOn", json!({"area": "kitchen", "brightness": 50})),
+            (
+                "HassGetState",
+                json!({"area": "kitchen", "fields": ["state"]}),
+            ),
+            ("HassTurnOn", json!({"area": 123})),
+        ] {
+            let err = execute(&mut client, intent, &payload).unwrap_err();
+            assert!(
+                matches!(err.kind, ErrorType::InvalidArguments),
+                "{intent} {payload}: {err}"
+            );
+        }
     }
 
     #[test]

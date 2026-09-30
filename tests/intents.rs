@@ -873,3 +873,29 @@ fn normalize_normal_result_without_content_still_requires_content() {
     let err = normalize_result(&json!({"isError": false})).unwrap_err();
     assert_eq!(err.message, "tool result has no content");
 }
+
+#[test]
+fn execute_assist_path_without_mcp_url_keeps_loose_payload_compatibility() {
+    // Этап 4.1: строгая интент-валидация применяется ТОЛЬКО на ha-mcp
+    // пути (`mcp_url` задан). Assist endpoint без `mcp_url` сохраняет
+    // прежнее поведение: payload передаётся инструменту как раньше.
+    let _cache = isolated_cache();
+    let transport = MockTransport::new(vec![json!({"name": "HassTurnOn"})]);
+    let mut client = make_client(&transport);
+
+    let data = execute(
+        &mut client,
+        "HassTurnOn",
+        &json!({"area": "Кухня", "custom_key": {"nested": true}}),
+    )
+    .unwrap();
+
+    assert_eq!(data["ok"], json!(true));
+    assert_eq!(
+        transport.tool_calls(),
+        vec![(
+            "HassTurnOn".to_string(),
+            json!({"area": "Кухня", "custom_key": {"nested": true}}),
+        )]
+    );
+}
