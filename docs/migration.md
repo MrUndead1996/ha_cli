@@ -67,10 +67,10 @@ MCP over HTTP JSON-RPC (`/api/mcp/assist`, protocolVersion `2025-03-26`).
 - [x] `client.rs`: `HttpTransport` на reqwest (rustls), таймауты, маппинг 401/403 → `AuthenticationError`, capture `Mcp-Session-Id`/`Mcp-Protocol-Version`, `initialize` → `tools_list` → `tools/call`
 - [x] Тесты с мок-транспортом (аналог `test_client.py`, включая случай stale-session)
 
-### Phase 2 — discovery
+### Phase 2 — discovery (готово)
 
-- [ ] `discovery.rs`: `discover_tools` (basename по `__`), ambiguous-детект, кэш `${XDG_CACHE_HOME:-~/.cache}/ha-cli/tools.json` c 0600, TTL 300 c, refresh-on-stale (`is_stale_tool_result`)
-- [ ] Тесты: `test_discovery.py` → `tests/discovery.rs` (TTL, кэш-файл, дубликаты basename)
+- [x] `discovery.rs`: `discover_tools` (basename по `__`), ambiguous-детект, кэш `${XDG_CACHE_HOME:-~/.cache}/ha-cli/tools.json` c 0600, TTL 300 c, refresh-on-stale (`is_stale_tool_result`)
+- [x] Тесты: `test_discovery.py` → `tests/discovery.rs` (TTL, кэш-файл, дубликаты basename)
 
 ### Phase 3 — intents
 
