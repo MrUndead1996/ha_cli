@@ -396,11 +396,18 @@ been performed» с вычищенными ID. Дефектов кода ауд�
 Живые проверки (read-only, 2026-09-30): `tools/list` после refresh —
 77 инструментов; `context` — 7 областей / 25 сущностей; read-only
 `HassGetState` по `bathroom` / `binary_sensor` — состояние `off`,
-успешный конверт `query_answer`. **Live write (включение/выключение,
-`HassLightSet` с `color_temp_kelvin`) остаётся непроверенным: ожидает
-выбранного пользователем одобренного тестового устройства.** До этого
-выбора переключение endpoint не выполняется; новых approval flows не
-требуется.
+успешный конверт `query_answer`. Live write (2026-09-30, цель выбрана владельцем —
+`{"area":"kitchen","domain":"switch"}`, режим `ha_auth`):
+массовый `HassTurnOn`/`HassTurnOff` по области+домену корректно
+остановился на первом недоступном устройстве (`Аэрогриль`:
+ENTITY_UNAVAILABLE) — exit 7, без повтора и rollback, частичный исход
+сообщён; точечные `HassTurnOn`/`HassTurnOff` по
+`{"area":"kitchen","name":"light_kitchen"}` — `action_done`,
+подтверждено чтением (`on`/`off`). `HassLightSet` с
+`color_temp_kelvin` на живом стенде ещё не проверялся — цель не
+выбрана (switch не поддерживает color temperature); покрытие —
+mock-тесты. Переключение боевой конфигурации на `HA_MCP_URL` —
+следующий шаг владельца; новых approval flows не требуется.
 
 ## Критерии приёмки
 
