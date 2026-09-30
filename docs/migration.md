@@ -72,11 +72,11 @@ MCP over HTTP JSON-RPC (`/api/mcp/assist`, protocolVersion `2025-03-26`).
 - [x] `discovery.rs`: `discover_tools` (basename по `__`), ambiguous-детект, кэш `${XDG_CACHE_HOME:-~/.cache}/ha-cli/tools.json` c 0600, TTL 300 c, refresh-on-stale (`is_stale_tool_result`)
 - [x] Тесты: `test_discovery.py` → `tests/discovery.rs` (TTL, кэш-файл, дубликаты basename)
 
-### Phase 3 — intents
+### Phase 3 — intents (готово)
 
-- [ ] `intents.rs`: `validate_intent` (готово), `execute`, `normalize_result`, `_normalize_arguments` (строка → массив, если schema ожидает array)
-- [ ] Интеграция с discovery: fallback `HassGetState` через live context
-- [ ] Тесты: `test_intents.py`, `test_security.py` → `tests/intents.rs`
+- [x] `intents.rs`: `validate_intent` (готово), `execute`, `normalize_result`, `_normalize_arguments` (строка → массив, если schema ожидает array)
+- [x] Интеграция с discovery: fallback `HassGetState` через live context
+- [x] Тесты: `test_intents.py`, `test_security.py` → `tests/intents.rs`
 
 ### Phase 4 — context
 

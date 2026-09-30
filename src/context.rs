@@ -15,3 +15,12 @@ pub fn get_live_context(_client: &mut crate::client::Client) -> Result<Json, HaC
         "context: not implemented yet",
     ))
 }
+
+// TODO(phase-4): перенос query_state из ha_cli/context.py (casefold-сопоставление
+// area/domain/name по live context).
+pub fn query_state(_live_context: &Json, _payload: &Json) -> Result<Json, HaCliError> {
+    Err(HaCliError::new(
+        crate::errors::ErrorType::Context,
+        "context: not implemented yet",
+    ))
+}
