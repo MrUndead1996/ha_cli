@@ -118,6 +118,28 @@ URL, часть path, секретный сегмент и токен редак
 
 ### 3. Семантическое разрешение (`src/context.rs`, `src/models.rs`)
 
+Реализовано (этап 3.3): `HassGetState` на ha-mcp (`src/intents.rs`,
+`execute_hamcp_get_state`) разрешает цели строго по полному каталогу
+`ha_search` через `resolver::prepare_action` (семантические селекторы,
+bound, fail-closed на malformed-записях — всё до любого чтения состояния),
+затем читает состояние `ha_get_state` по внутренним ID — по одному ID за
+вызов (`fields=["state","attributes"]`; форма ответа
+`{data:{state,attributes}, metadata}` подтверждена на живом сервере).
+Поддержан возможный bulk-wrapper (`states`/`errors`/`count`/`error_count`):
+непустые `errors`/`error_count` распространяются как ошибка, `state` берётся
+только из единственного элемента `states`. Состояние всегда из живого
+`ha_get_state`, а не из устаревшего поля `state` каталога; `isError`,
+`success:false` и отсутствие/нестроковость `state` — fail-closed ошибки
+(`intent_failed`), а не «unknown». Ответ собирается в прежнем конверте
+`ok`/`response_type:"query_answer"`/`speech`/`data.states` с семантическими
+именами area/domain/name; внутренние ID наружу не отражаются — scrub
+по всем подготовленным целям применяется к ЛЮБОЙ ошибке после разрешения
+(ошибки JSON-RPC/транспорта от `tools_call`, stale-refresh и discovery
+включительно), так как текст сервера может отражать переданные ID.
+Stale-refresh кэша схем разрешён только для этого read-only вызова;
+повторные вызовы действий после отправки по-прежнему не выполняются.
+Assist-путь без `mcp_url` (fallback `query_state`) не изменён.
+
 Реализовано (этап 3.2): `src/resolver.rs` — строгое разрешение целей
 действий по `area` / `domain` / `name` из отфильтрованного каталога
 `ha_search` (через `get_live_context`, собираемого заново на каждое
@@ -139,8 +161,8 @@ URL, часть path, секретный сегмент и токен редак
 по-прежнему отклоняет пользовательский `entity_id` до сети; в подготовке
 ha-mcp вызовов (`intents::execute` при `mcp_url`) действие после
 успешного разрешения возвращает `tool_not_found` «not implemented yet» —
-путь исполнения (`ha_call_service`) добавляется на этапе 4,
-`HassGetState` мигрирует на 3.3. Assist-путь без `mcp_url` не изменён.
+путь исполнения (`ha_call_service`) добавляется на этапе 4.
+Assist-путь без `mcp_url` не изменён.
 
 Реализовано (этап 3.1): `GetLiveContext` заменён на `ha_search` только при
 настроенном `mcp_url` (ha-mcp 8.6.0); Assist-путь без `mcp_url` и его тесты
