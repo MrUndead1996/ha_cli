@@ -100,7 +100,8 @@ fn make_client(transport: FakeTransport) -> Client {
     let mut secrets = Secrets::new();
     secrets.register("test-token");
     let config = Config {
-        url: "http://ha.test:8123".to_string(),
+        url: Some("http://ha.test:8123".to_string()),
+        mcp_url: None,
         token: "test-token".to_string(),
         timeout: 5,
     };

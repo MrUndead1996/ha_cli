@@ -6,6 +6,24 @@ use serde_json::{json, Value as Json};
 pub const ASSIST_MCP_ENDPOINT: &str = "/api/mcp/assist";
 pub const PROTOCOL_VERSION: &str = "2025-03-26";
 
+/// Полный endpoint запроса: настроенный MCP URL используется как есть
+/// (webhook `/api/webhook/<secret>` или прямой `/private_<secret>`),
+/// иначе прежний Assist endpoint на базе `HA_URL`.
+pub fn resolve_endpoint(config: &Config) -> String {
+    match &config.mcp_url {
+        Some(mcp_url) => mcp_url.clone(),
+        None => format!(
+            "{}{}",
+            config
+                .url
+                .as_deref()
+                .unwrap_or_default()
+                .trim_end_matches('/'),
+            ASSIST_MCP_ENDPOINT
+        ),
+    }
+}
+
 /// Точка подмены транспорта в тестах (аналог httpx.BaseTransport).
 pub trait Transport {
     fn post(
@@ -70,7 +88,7 @@ impl Client {
         let headers = self.extra_headers();
         let response = self
             .transport
-            .post(&self.config.url, payload, &headers)
+            .post(&resolve_endpoint(&self.config), payload, &headers)
             .map_err(|mut err| {
                 err.message = self.secrets.redact(&err.message);
                 err
@@ -210,11 +228,15 @@ pub struct HttpTransport {
 impl HttpTransport {
     pub fn new(config: &Config) -> Result<Self, HaCliError> {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", config.token))
-                .map_err(|e| HaCliError::new(ErrorType::Configuration, e.to_string()))?,
-        );
+        // HA_TOKEN не отправляется на другой адрес: секретный URL
+        // авторизуется сам по себе.
+        if let Some(auth) = auth_header(config) {
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&auth)
+                    .map_err(|e| HaCliError::new(ErrorType::Configuration, e.to_string()))?,
+            );
+        }
         headers.insert(
             reqwest::header::CONTENT_TYPE,
             reqwest::header::HeaderValue::from_static("application/json"),
@@ -229,6 +251,16 @@ impl HttpTransport {
             .build()
             .map_err(|e| HaCliError::new(ErrorType::Configuration, e.to_string()))?;
         Ok(Self { http })
+    }
+}
+
+/// Bearer `HA_TOKEN` только для прежнего Assist endpoint; секретный URL
+/// авторизуется сам по себе и токен по умолчанию не получает.
+pub fn auth_header(config: &Config) -> Option<String> {
+    if config.mcp_url.is_some() || config.token.is_empty() {
+        None
+    } else {
+        Some(format!("Bearer {}", config.token))
     }
 }
 

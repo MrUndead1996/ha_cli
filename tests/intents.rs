@@ -154,7 +154,8 @@ fn default_call_result() -> Json {
 fn make_client(transport: &MockTransport) -> Client {
     let secrets = Secrets::new();
     let config = Config {
-        url: "http://ha.test:8123".to_string(),
+        url: Some("http://ha.test:8123".to_string()),
+        mcp_url: None,
         token: String::new(),
         timeout: 5,
     };
