@@ -345,6 +345,25 @@ Assist-путь без `mcp_url`, `HassGetState` (read-only) и exit/JSON contra
   вложенности, разрешённый параметр цветовой температуры, ошибки сервиса,
   redaction секретного URL и отсутствие повторного выполнения действия.
   Запустить `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`.
+
+Реализовано (этап 5, подпункт 2 — аудит тестов): юнит/mock-покрытие этапов
+2–4 сохранено без дублирования (URL/auth/SSE — `src/client.rs`, пагинация
+и partial/errors fail-closed — `tests/context.rs`, запрет entity_id в любой
+вложенности до сети — `src/intents.rs` NoNetwork и `tests/intents.rs`,
+`color_temp_kelvin` → `data.color_temp_kelvin`, scrub и no-retry —
+`src/intents.rs`, изоляция кэша по endpoint — `tests/discovery.rs`,
+redaction — `tests/cli.rs`/`tests/client.rs`). Добавлен недостающий
+межмодульный сценарий `tests/hamcp_dispatch.rs` — от разбора `Cli` через
+`dispatch` до RecordingTransport на ha-mcp: URL как есть (без суффикса
+Assist) и Bearer `ha_auth`/отсутствие Authorization по умолчанию на каждом
+запросе, SSE `initialize`/`tools/list` сквозь весь поток, пагинация
+каталога по `entity_next_offset` (2 страницы, сервер режет страницу до 2),
+`HassLightSet color_temp_kelvin` → единственный `ha_call_service` с
+`data.color_temp_kelvin` и только валидированными полями, read-only
+`HassGetState` — успешный вывод `query_answer` без `ha_call_service` и без
+внутренних ID, вложенный `entity_id` — отклонён с нулём сетевых вызовов,
+JSON-RPC error на записи — ровно один вызов без повтора и «may still have
+been performed» с вычищенными ID. Дефектов кода аудит не выявил.
 - Обновить `skills/ha-control/SKILL.md`, `README.md`, примеры настройки
   и описание того, что `--raw`/`speech` меняют источник данных. На стенде
   проверить `context`, состояние, включение/выключение и параметры света;
