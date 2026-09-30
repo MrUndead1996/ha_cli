@@ -516,7 +516,7 @@ fn execute_stale_tool_result_triggers_refresh_and_retry() {
 }
 
 #[test]
-fn get_state_fallback_context_error_propagates_while_context_is_stub() {
+fn get_state_fallback_context_error_propagates_on_bad_text() {
     let _cache = isolated_cache();
     let transport = MockTransport::new(vec![json!({"name": "homeassistant__GetLiveContext"})]);
     let mut client = make_client(&transport);
@@ -529,13 +529,16 @@ fn get_state_fallback_context_error_propagates_while_context_is_stub() {
     .unwrap_err();
 
     assert_eq!(err.kind.as_str(), ErrorType::Context.as_str());
-    assert_eq!(transport.tool_calls().len(), 0);
+    // Ответ мока ("Turned on") — не JSON, парсер live context падает.
+    assert_eq!(
+        transport.tool_calls(),
+        vec![("homeassistant__GetLiveContext".to_string(), json!({}))],
+    );
 }
 
 // Полный порт test_get_state_falls_back_to_live_context_when_tool_is_missing:
 // требует живой реализации context (Phase 4).
 #[test]
-#[ignore = "unblocked in Phase 4: requires context::query_state"]
 fn get_state_falls_back_to_live_context_when_tool_is_missing() {
     let _cache = isolated_cache();
     let transport = MockTransport::new(vec![json!({"name": "homeassistant__GetLiveContext"})]);

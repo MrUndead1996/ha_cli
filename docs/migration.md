@@ -78,12 +78,12 @@ MCP over HTTP JSON-RPC (`/api/mcp/assist`, protocolVersion `2025-03-26`).
 - [x] Интеграция с discovery: fallback `HassGetState` через live context
 - [x] Тесты: `test_intents.py`, `test_security.py` → `tests/intents.rs`
 
-### Phase 4 — context
+### Phase 4 — context (готово)
 
-- [ ] `context.rs`: `get_raw_result`, `parse_live_context`, unwrap `{success, result}` с текстовым форматом `Live Context:` (парсер перенести дословно, включая кавычки-обёртки)
-- [ ] `build_context` (areas + aliases, сортировка), `compact_context`, `size_report`
-- [ ] `query_state` — casefold-сопоставление area/domain/name
-- [ ] Тесты: `test_context.py` → `tests/context.rs`
+- [x] `context.rs`: `get_raw_result`, `parse_live_context`, unwrap `{success, result}` с текстовым форматом `Live Context:` (парсер перенести дословно, включая кавычки-обёртки)
+- [x] `build_context` (areas + aliases, сортировка), `compact_context`, `size_report`
+- [x] `query_state` — casefold-сопоставление area/domain/name
+- [x] Тесты: `test_context.py` → `tests/context.rs`
 
 ### Phase 5 — CLI-склейка и паритет
 
