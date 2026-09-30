@@ -5,7 +5,7 @@ schema = "openclaw-skill/v1"
 
 [skill]
 name = "ha-control"
-version = "0.1.0"
+version = "0.2.0"
 description = "Управляй устройствами Home Assistant через локальный CLI ha: включай и выключай свет и технику, спрашивай состояние сущностей по имени области, домену или имени устройства."
 
 [install]
