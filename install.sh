@@ -6,8 +6,14 @@
 # - устанавливает его в ~/.local/bin/ha (atomic install, бэкап старого);
 # - при --skills-root PATH копирует скилл в <PATH>/ha-control/,
 #   подставляя {{HA_BIN}} в SKILL.md;
-# - конфиг ~/.config/ha-cli/config.toml НЕ трогает: он создаётся
-#   вручную (url, token/token_file, права 0600 — см. README).
+# - автоматически определяет fresh install и update: если репозиторий —
+#   git-клон, подтягивает обновления (git pull --ff-only, чистое
+#   дерево; при локальных изменениях или сбое — предупреждение и
+#   сборка локального состояния), затем пересобирает и заменяет
+#   бинарник/скилл (бэкап старого, откат при сбое);
+#   конфиг ~/.config/ha-cli/config.toml НЕ трогает: он создаётся
+#   вручную (url, token/token_file, mcp_url/mcp_auth, права 0600 —
+#   см. README).
 #
 # Usage: install.sh [--skills-root PATH]
 #   --skills-root PATH   Установить скилл OpenClaw в PATH
@@ -123,6 +129,35 @@ finish() {
 trap finish EXIT
 
 # ---------------------------------------------------------------------------
+# 0. Update the repository (automatic when run from a git clone).
+#    Fast-forward only; local changes or fetch/pull problems do not
+#    block installation — we warn and build the local state.
+# ---------------------------------------------------------------------------
+
+if [ -d "$REPO_ROOT/.git" ] && command -v git >/dev/null 2>&1; then
+	cd "$REPO_ROOT"
+	if [ -n "$(git status --porcelain)" ]; then
+		log "warning: working tree has local changes; skipping repo update"
+	elif ! git fetch --quiet 2>/dev/null; then
+		log "warning: git fetch failed; building current checkout"
+	else
+		OLD_HEAD="$(git rev-parse --short HEAD)"
+		if git pull --ff-only --quiet 2>/dev/null; then
+			NEW_HEAD="$(git rev-parse --short HEAD)"
+			if [ "$OLD_HEAD" = "$NEW_HEAD" ]; then
+				log "repository already up to date ($OLD_HEAD)"
+			else
+				log "updated repository $OLD_HEAD -> $NEW_HEAD"
+			fi
+		else
+			log "warning: git pull --ff-only failed (branch diverged?); building current checkout"
+		fi
+	fi
+else
+	log "not a git clone (or git missing); building current sources"
+fi
+
+# ---------------------------------------------------------------------------
 # 1. Build.
 # ---------------------------------------------------------------------------
 
@@ -130,6 +165,14 @@ log "building release binary"
 cargo build --release --locked --manifest-path "$REPO_ROOT/Cargo.toml"
 NEW_BIN="$REPO_ROOT/target/release/$BIN_NAME"
 [ -x "$NEW_BIN" ] || die "build did not produce $NEW_BIN"
+
+# Version strings for before/after reporting; old binary may predate
+# the --version flag, treat that as "unknown".
+version_of() {
+	"$1" --version 2>/dev/null | head -1 || printf 'unknown'
+}
+OLD_VERSION="none"
+[ -x "$BIN_DIR/$BIN_NAME" ] && OLD_VERSION="$(version_of "$BIN_DIR/$BIN_NAME")"
 
 # ---------------------------------------------------------------------------
 # 2. Install binary (backup previous, atomic-ish replace).
@@ -141,7 +184,8 @@ if [ -e "$BIN_DIR/$BIN_NAME" ]; then
 fi
 install -m 755 "$NEW_BIN" "$BIN_DIR/$BIN_NAME"
 TXN_DIRTY=1
-log "installed $BIN_DIR/$BIN_NAME"
+NEW_VERSION="$(version_of "$BIN_DIR/$BIN_NAME")"
+log "installed $BIN_DIR/$BIN_NAME (version: $OLD_VERSION -> $NEW_VERSION)"
 
 # ---------------------------------------------------------------------------
 # 3. Smoke test: binary runs and config check gives a sane answer.

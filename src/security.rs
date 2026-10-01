@@ -171,6 +171,192 @@ pub fn looks_like_entity_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// Семантические селекторы, общие для всех интентов.
+const SELECTOR_KEYS: &[&str] = &["area", "domain", "name"];
+
+/// Проверка, что значение является ЦЕЛОЧИСЛЕННЫМ JSON-числом в диапазоне
+/// `[lo, hi]`. Принимается только `serde_json::Number` с целым
+/// представлением (`as_i64`/`as_u64`): дробные литералы вроде `50.0`
+/// отклоняются как другой JSON-тип, без cast через f64.
+fn whole_number_in_range(value: &Json, lo: i64, hi: i64) -> Option<i64> {
+    let number = value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|v| i64::try_from(v).ok()))?;
+    if number < lo || number > hi {
+        return None;
+    }
+    Some(number)
+}
+
+fn invalid(key: &str, requirement: &str) -> String {
+    format!("{key}: {requirement}")
+}
+
+/// Проверка одного параметра сервисных данных по интент-специфичному
+/// allowlist с типами и диапазонами (docs/mcp_migration.md, этап 4.1).
+/// Значение семантики: `brightness` — 0..100 как в существующем скилле,
+/// на ha-mcp (этап 4.2) отображается в подтверждённое поле
+/// `brightness_pct` сервиса `light.turn_on`.
+fn validate_service_param(intent: &str, key: &str, value: &Json) -> Result<(), String> {
+    match (intent, key) {
+        ("HassLightSet", "brightness") => {
+            if whole_number_in_range(value, 0, 100).is_none() {
+                return Err(invalid(
+                    key,
+                    "must be a whole number from 0 to 100 (percent)",
+                ));
+            }
+        }
+        ("HassLightSet", "color_temp_kelvin") => {
+            // Поле подтверждено живым ha_list_services (light.turn_on,
+            // этап 1); диапазон — разумная граница вокруг рабочих значений
+            // бытовых ламп; точный min/max атрибутов конкретной лампы
+            // не проверяется до сети.
+            if whole_number_in_range(value, 1000, 12000).is_none() {
+                return Err(invalid(
+                    key,
+                    "must be a whole number of kelvin from 1000 to 12000",
+                ));
+            }
+        }
+        ("HassLightSet", "transition") => {
+            let finite = value.as_f64().filter(|v| v.is_finite());
+            match finite {
+                Some(seconds) if (0.0..=300.0).contains(&seconds) => {}
+                _ => {
+                    return Err(invalid(
+                        key,
+                        "must be a finite number of seconds from 0 to 300",
+                    ))
+                }
+            }
+        }
+        ("HassLightSet", "rgb_color") => {
+            let channels = value.as_array().filter(|items| items.len() == 3);
+            let valid = channels.is_some_and(|items| {
+                items
+                    .iter()
+                    .all(|channel| whole_number_in_range(channel, 0, 255).is_some())
+            });
+            if !valid {
+                return Err(invalid(
+                    key,
+                    "must be an array of three whole numbers from 0 to 255",
+                ));
+            }
+        }
+        ("HassLightSet", "effect") => {
+            if value
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none()
+            {
+                return Err(invalid(key, "must be a non-empty string"));
+            }
+        }
+        ("HassSetPosition", "position") => {
+            if whole_number_in_range(value, 0, 100).is_none() {
+                return Err(invalid(
+                    key,
+                    "must be a whole number from 0 to 100 (percent)",
+                ));
+            }
+        }
+        (_, unexpected) => {
+            let allowed = match intent {
+                "HassLightSet" => {
+                    "area, domain, name, brightness, color_temp_kelvin, transition, \
+                     rgb_color, effect"
+                }
+                "HassSetPosition" => "area, domain, name, position",
+                "HassTurnOn" | "HassTurnOff" | "HassGetState" => "area, domain, name",
+                other => return Err(format!("unknown intent '{other}'")),
+            };
+            return Err(format!(
+                "{unexpected}: parameter is not allowed for {intent}; allowed keys: {allowed}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Строгая валидация payload действия ДО любых сетевых вызовов
+/// (docs/mcp_migration.md, этап 4.1), для ha-mcp-пути (`mcp_url` задан).
+/// Включает рекурсивный запрет `entity_id` (`validate_entity_payload`),
+/// проверку неизвестных ключей по интент-специфичному allowlist, типов
+/// и диапазонов значений, а также допустимых сочетаний параметров:
+/// - селекторы `area` / `domain` / `name` обязаны быть непустыми строками,
+///   если присутствуют (не-строковый селектор — ошибка, а не молчаливое
+///   игнорирование);
+/// - `color_temp_kelvin` и `rgb_color` взаимно исключающие (разные цветовые
+///   режимы света);
+/// - `HassLightSet` требует домен `light`, `HassSetPosition` — домен `cover`,
+///   если домен указан явно (проверка ДО сети, по селектору).
+///
+/// Assist-путь без `mcp_url` продолжает использовать только
+/// `validate_entity_payload` и не меняется.
+pub fn validate_intent_payload(intent: &str, payload: &Json) -> Result<(), String> {
+    validate_entity_payload(payload)?;
+    let object = payload
+        .as_object()
+        .ok_or_else(|| "payload must be a JSON object".to_string())?;
+    for key in SELECTOR_KEYS {
+        if let Some(value) = object.get(*key) {
+            if value
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none()
+            {
+                return Err(invalid(key, "selector must be a non-empty string"));
+            }
+        }
+    }
+    for (key, value) in object {
+        if !SELECTOR_KEYS.contains(&key.as_str()) {
+            validate_service_param(intent, key, value)?;
+        }
+    }
+    // `HassSetPosition` без `position` бессмысленен: параметр обязателен.
+    if intent == "HassSetPosition" && !object.contains_key("position") {
+        return Err(invalid(
+            "position",
+            "is required for HassSetPosition (whole number from 0 to 100)",
+        ));
+    }
+    // Взаимно исключающие параметры света: цветовая температура задаёт
+    // цветовой режим color_temp, RGB — rgb; одновременно они не передаются.
+    if intent == "HassLightSet"
+        && object.contains_key("color_temp_kelvin")
+        && object.contains_key("rgb_color")
+    {
+        return Err(invalid(
+            "color_temp_kelvin",
+            "and rgb_color are mutually exclusive color modes; specify only one",
+        ));
+    }
+    // Проверка домена по селектору до сети: параметры не имеют смысла для
+    // других доменов, и запрос не должен доходить до разрешения/вызова.
+    let domain = object
+        .get("domain")
+        .and_then(Json::as_str)
+        .map(|domain| domain.trim().to_lowercase());
+    if let Some(domain) = domain {
+        let expected = match intent {
+            "HassLightSet" => "light",
+            "HassSetPosition" => "cover",
+            _ => return Ok(()),
+        };
+        if domain != expected {
+            return Err(format!(
+                "domain '{domain}' is not supported for {intent}; expected '{expected}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_entity_payload(payload: &Json) -> Result<(), String> {
     validate_node(payload, "payload")
 }
@@ -226,5 +412,121 @@ mod tests {
     fn rejects_entity_id_payload() {
         let err = validate_entity_payload(&json!({"name": "light.kitchen"}));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn intent_payload_accepts_valid_combinations() {
+        for (intent, payload) in [
+            ("HassTurnOn", json!({"area": "kitchen"})),
+            ("HassTurnOff", json!({"area": "bedroom", "domain": "light"})),
+            ("HassGetState", json!({"name": "Lamp"})),
+            (
+                "HassLightSet",
+                json!({"area": "кухня", "name": "Лампа", "brightness": 50}),
+            ),
+            (
+                "HassLightSet",
+                json!({"area": "кухня", "color_temp_kelvin": 3000, "transition": 1.5}),
+            ),
+            (
+                "HassLightSet",
+                json!({"name": "Lamp", "rgb_color": [255, 0, 128]}),
+            ),
+            (
+                "HassSetPosition",
+                json!({"area": "bedroom", "position": 70}),
+            ),
+        ] {
+            assert!(
+                validate_intent_payload(intent, &payload).is_ok(),
+                "{intent} {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn intent_payload_rejects_unknown_keys() {
+        for (intent, key) in [
+            ("HassTurnOn", "entity_id"),
+            ("HassTurnOn", "data"),
+            ("HassGetState", "fields"),
+            ("HassTurnOff", "brightness"),
+            ("HassLightSet", "position"),
+            ("HassSetPosition", "brightness"),
+        ] {
+            let mut payload = serde_json::Map::new();
+            payload.insert(key.to_string(), json!("x"));
+            let err = validate_intent_payload(intent, &Json::Object(payload)).unwrap_err();
+            assert!(err.contains("not allowed"), "{intent}: {err}");
+        }
+    }
+
+    #[test]
+    fn intent_payload_rejects_bad_types_and_ranges() {
+        for (intent, payload) in [
+            ("HassLightSet", json!({"brightness": 101})),
+            ("HassLightSet", json!({"brightness": -1})),
+            ("HassLightSet", json!({"brightness": "50"})),
+            ("HassLightSet", json!({"brightness": 50.5})),
+            // Дробный JSON-литерал — другой тип, отклоняется даже при
+            // целом значении (контракт: целое число, не float).
+            ("HassLightSet", json!({"brightness": 50.0})),
+            ("HassLightSet", json!({"color_temp_kelvin": 3000.0})),
+            ("HassLightSet", json!({"rgb_color": [1.0, 2, 3]})),
+            ("HassSetPosition", json!({"position": 70.0})),
+            ("HassLightSet", json!({"color_temp_kelvin": 999})),
+            ("HassLightSet", json!({"color_temp_kelvin": "3000"})),
+            ("HassLightSet", json!({"transition": -0.1})),
+            ("HassLightSet", json!({"rgb_color": [255, 0]})),
+            ("HassLightSet", json!({"rgb_color": [255, 0, 999]})),
+            ("HassLightSet", json!({"effect": ""})),
+            ("HassSetPosition", json!({"position": 101})),
+            ("HassSetPosition", json!({"position": "70"})),
+        ] {
+            assert!(
+                validate_intent_payload(intent, &payload).is_err(),
+                "{intent} {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn intent_payload_requires_string_selectors() {
+        for payload in [
+            json!({"area": 123}),
+            json!({"area": "kitchen", "name": 42}),
+            json!({"area": ""}),
+            json!({"domain": ["light"]}),
+        ] {
+            assert!(
+                validate_intent_payload("HassTurnOn", &payload).is_err(),
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn intent_payload_rejects_incompatible_combinations() {
+        let both = json!({"area": "kitchen", "color_temp_kelvin": 3000, "rgb_color": [1, 2, 3]});
+        let err = validate_intent_payload("HassLightSet", &both).unwrap_err();
+        assert!(err.contains("mutually exclusive"));
+        let err =
+            validate_intent_payload("HassLightSet", &json!({"domain": "switch"})).unwrap_err();
+        assert!(err.contains("expected 'light'"));
+        let err = validate_intent_payload(
+            "HassSetPosition",
+            &json!({"domain": "light", "position": 50}),
+        )
+        .unwrap_err();
+        assert!(err.contains("expected 'cover'"));
+        assert!(validate_intent_payload("HassLightSet", &json!({"domain": "Light"})).is_ok());
+    }
+
+    #[test]
+    fn intent_payload_still_bans_entity_id_everywhere() {
+        let err =
+            validate_intent_payload("HassLightSet", &json!({"data": {"entity_ids": ["x.y"]}}))
+                .unwrap_err();
+        assert!(err.contains("entity"));
     }
 }

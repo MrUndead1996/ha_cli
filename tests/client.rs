@@ -1,4 +1,4 @@
-use ha_cli::client::{Client, Transport};
+use ha_cli::client::{auth_header, resolve_endpoint, Client, Transport, ASSIST_MCP_ENDPOINT};
 use ha_cli::config::Config;
 use ha_cli::errors::{ErrorType, HaCliError};
 use ha_cli::security::Secrets;
@@ -6,6 +6,7 @@ use serde_json::{json, Value as Json};
 use std::sync::{Arc, Mutex};
 
 struct Recorded {
+    url: String,
     payload: Json,
     headers: Vec<(String, String)>,
 }
@@ -46,11 +47,12 @@ impl MockTransport {
 impl Transport for MockTransport {
     fn post(
         &mut self,
-        _url: &str,
+        url: &str,
         payload: &Json,
         headers: &[(String, String)],
     ) -> Result<ha_cli::client::HttpResponse, HaCliError> {
         self.requests.lock().unwrap().push(Recorded {
+            url: url.to_string(),
             payload: payload.clone(),
             headers: headers.to_vec(),
         });
@@ -86,13 +88,25 @@ fn tools() -> Json {
 }
 
 fn make_client(transport: MockTransport) -> Client {
+    make_client_with_config(
+        transport,
+        Config {
+            url: Some("http://ha.test:8123".to_string()),
+            mcp_url: None,
+            mcp_auth: Default::default(),
+            token: "secret".to_string(),
+            timeout: 5,
+            connect_timeout: 5,
+        },
+    )
+}
+
+fn make_client_with_config(transport: MockTransport, config: Config) -> Client {
     let mut secrets = Secrets::new();
     secrets.register("secret");
-    let config = Config {
-        url: "http://ha.test:8123".to_string(),
-        token: "secret".to_string(),
-        timeout: 5,
-    };
+    if let Some(mcp_url) = &config.mcp_url {
+        secrets.register(mcp_url);
+    }
     Client::new(config, Box::new(transport), &secrets)
 }
 
@@ -204,9 +218,12 @@ fn connection_error_from_transport() {
     secrets.register("secret");
     let mut client = Client::new(
         Config {
-            url: "http://ha.test:8123".to_string(),
+            url: Some("http://ha.test:8123".to_string()),
+            mcp_url: None,
+            mcp_auth: Default::default(),
             token: "secret".to_string(),
             timeout: 5,
+            connect_timeout: 5,
         },
         Box::new(Failing),
         &secrets,
@@ -365,4 +382,213 @@ fn stale_session_resent_on_each_request() {
         );
     let mut client = make_client(transport);
     client.tools_list().unwrap();
+}
+
+#[test]
+fn assist_endpoint_appended_when_no_mcp_url() {
+    let transport = MockTransport::new(|_payload, _headers| (200, Vec::new(), String::new()));
+    let requests = transport.clone();
+    let mut client = make_client(transport);
+    client.notify("notifications/initialized", None).unwrap();
+    let reqs = requests.requests.lock().unwrap();
+    assert_eq!(reqs[0].url, "http://ha.test:8123/api/mcp/assist");
+}
+
+#[test]
+fn mcp_url_used_as_is_webhook() {
+    let transport = MockTransport::new(|_payload, _headers| (200, Vec::new(), String::new()));
+    let requests = transport.clone();
+    let mut client = make_client_with_config(
+        transport,
+        Config {
+            url: Some("http://ha.test:8123".to_string()),
+            mcp_url: Some("http://ha.test:8123/api/webhook/wh_secret123".to_string()),
+            mcp_auth: Default::default(),
+            token: String::new(),
+            timeout: 5,
+            connect_timeout: 5,
+        },
+    );
+    client.notify("notifications/initialized", None).unwrap();
+    let reqs = requests.requests.lock().unwrap();
+    assert_eq!(reqs[0].url, "http://ha.test:8123/api/webhook/wh_secret123");
+    assert!(!reqs[0].url.contains(ASSIST_MCP_ENDPOINT));
+    assert!(!reqs[0]
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("Authorization")));
+}
+
+#[test]
+fn mcp_url_used_as_is_direct_private_path() {
+    let transport = MockTransport::new(|_payload, _headers| (200, Vec::new(), String::new()));
+    let requests = transport.clone();
+    let mut client = make_client_with_config(
+        transport,
+        Config {
+            url: Some("http://ha.test:8123".to_string()),
+            mcp_url: Some("http://127.0.0.1:8123/private_prv_secret456".to_string()),
+            mcp_auth: Default::default(),
+            token: String::new(),
+            timeout: 5,
+            connect_timeout: 5,
+        },
+    );
+    client.notify("notifications/initialized", None).unwrap();
+    let reqs = requests.requests.lock().unwrap();
+    assert_eq!(reqs[0].url, "http://127.0.0.1:8123/private_prv_secret456");
+}
+
+#[test]
+fn secret_mcp_url_redacted_in_transport_error() {
+    struct Failing;
+    impl Transport for Failing {
+        fn post(
+            &mut self,
+            url: &str,
+            _payload: &Json,
+            _headers: &[(String, String)],
+        ) -> Result<ha_cli::client::HttpResponse, HaCliError> {
+            Err(HaCliError::new(
+                ErrorType::Connection,
+                format!("refused: {url}"),
+            ))
+        }
+    }
+    let mut secrets = Secrets::new();
+    let mcp_url = "http://ha.test:8123/api/webhook/wh_secret789".to_string();
+    secrets.register(&mcp_url);
+    let mut client = Client::new(
+        Config {
+            url: Some("http://ha.test:8123".to_string()),
+            mcp_url: Some(mcp_url),
+            mcp_auth: Default::default(),
+            token: String::new(),
+            timeout: 5,
+            connect_timeout: 5,
+        },
+        Box::new(Failing),
+        &secrets,
+    );
+    let err = client.tools_list().unwrap_err();
+    assert!(!err.message.contains("wh_secret789"));
+    assert!(err.message.contains("[REDACTED]"), "{}", err.message);
+}
+
+#[test]
+fn auth_header_only_for_assist_endpoint() {
+    let assist = Config {
+        url: Some("http://ha.test:8123".to_string()),
+        mcp_url: None,
+        mcp_auth: Default::default(),
+        token: "ha-token".to_string(),
+        timeout: 5,
+        connect_timeout: 5,
+    };
+    assert_eq!(auth_header(&assist), Some("Bearer ha-token".to_string()));
+    assert_eq!(
+        resolve_endpoint(&assist),
+        "http://ha.test:8123/api/mcp/assist"
+    );
+    let webhook = Config {
+        url: Some("http://ha.test:8123".to_string()),
+        mcp_url: Some("http://ha.test:8123/api/webhook/wh_s".to_string()),
+        mcp_auth: Default::default(),
+        token: "ha-token".to_string(),
+        timeout: 5,
+        connect_timeout: 5,
+    };
+    assert_eq!(auth_header(&webhook), None);
+    assert_eq!(
+        resolve_endpoint(&webhook),
+        "http://ha.test:8123/api/webhook/wh_s"
+    );
+}
+
+#[test]
+fn auth_header_ha_auth_opt_in_sends_token_to_mcp_url() {
+    let webhook = Config {
+        url: Some("http://ha.test:8123".to_string()),
+        mcp_url: Some("http://ha.test:8123/api/webhook/wh_s".to_string()),
+        mcp_auth: ha_cli::config::McpAuth::HaAuth,
+        token: "ha-token".to_string(),
+        timeout: 5,
+        connect_timeout: 5,
+    };
+    assert_eq!(auth_header(&webhook), Some("Bearer ha-token".to_string()));
+}
+
+// --- 2.4: различение JSON-RPC ошибки и redaction отражённых секретов ---
+
+fn json_rpc_error(message: &str) -> Resp {
+    json_response(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": -32000, "message": message},
+    }))
+}
+
+#[test]
+fn json_rpc_error_message_is_redacted() {
+    let webhook = "http://ha.local/api/webhook/wh_s3cret";
+    let transport = MockTransport::new(move |_payload, _headers| {
+        json_rpc_error(&format!("POST {webhook} failed for bearer sk_live_token"))
+    });
+    let config = Config {
+        url: Some("http://ha.test:8123".to_string()),
+        mcp_url: Some(webhook.to_string()),
+        mcp_auth: Default::default(),
+        token: String::new(),
+        timeout: 5,
+        connect_timeout: 5,
+    };
+    let mut secrets = ha_cli::security::Secrets::new();
+    secrets.register("sk_live_token");
+    ha_cli::config::register_mcp_secrets(&mut secrets, webhook);
+    let mut client = Client::new(config, Box::new(transport), &secrets);
+    let err = client.call("tools/list", None).unwrap_err();
+    assert_eq!(err.kind.as_str(), ErrorType::HaApi.as_str());
+    let rendered = secrets.redact(&err.to_json());
+    assert!(!rendered.contains("wh_s3cret"));
+    assert!(!rendered.contains("/api/webhook/"));
+    assert!(!rendered.contains("sk_live_token"));
+    assert!(rendered.contains("[REDACTED]"));
+}
+
+#[test]
+fn json_rpc_error_over_sse_is_ha_api_error_and_redacted() {
+    let message = "call failed near /private_s3cret with token sk_live_token";
+    let transport = MockTransport::new(move |payload, _headers| {
+        let body = format!(
+            "event: message\ndata: {}\n\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "error": {"code": -32000, "message": message},
+            })
+        );
+        (
+            200,
+            vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+            body,
+        )
+    });
+    let mut secrets = Secrets::new();
+    secrets.register("sk_live_token");
+    ha_cli::config::register_mcp_secrets(&mut secrets, "http://ha.local/private_s3cret");
+    let config = Config {
+        url: Some("http://ha.test:8123".to_string()),
+        mcp_url: Some("http://ha.local/private_s3cret".to_string()),
+        mcp_auth: Default::default(),
+        token: String::new(),
+        timeout: 5,
+        connect_timeout: 5,
+    };
+    let mut client = Client::new(config, Box::new(transport), &secrets);
+    let err = client.call("tools/call", Some(&json!({}))).unwrap_err();
+    assert_eq!(err.kind.as_str(), ErrorType::HaApi.as_str());
+    let rendered = secrets.redact(&err.to_json());
+    assert!(!rendered.contains("s3cret"));
+    assert!(!rendered.contains("sk_live_token"));
+    assert!(rendered.contains("[REDACTED]"));
 }

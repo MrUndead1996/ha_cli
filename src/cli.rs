@@ -9,7 +9,11 @@ use clap::{Parser, Subcommand};
 use serde_json::{Map, Value as Json};
 
 #[derive(Parser)]
-#[command(name = "ha", about = "Home Assistant Intent CLI for AI agents")]
+#[command(
+    name = "ha",
+    version,
+    about = "Home Assistant Intent CLI for AI agents"
+)]
 pub struct Cli {
     /// Print debug trace to stderr on unexpected errors
     #[arg(long)]
@@ -22,6 +26,12 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Print live Assist context
+    ///
+    /// `--raw`: без `mcp_url` — сырой результат `GetLiveContext` (Assist);
+    /// с настроенным `mcp_url` (ha-mcp) — агрегированный ответ `ha_search`
+    /// по всем страницам (`entities`, `entity_total_matches`, `partial`,
+    /// `errors`, `source`, `pages`). URL с секретом и токен в вывод и логи
+    /// не попадают: секреты редактируются перед печатью.
     Context {
         #[arg(long)]
         raw: bool,
@@ -136,7 +146,9 @@ pub fn dispatch(cli: &Cli, client: &mut Client) -> Result<String, HaCliError> {
             }
         }
         Command::Tools { json, refresh } => {
-            let mut discovery = ToolDiscovery::new(None);
+            // Кэш изолирован по endpoint: Assist и ha-mcp (и разные ha-mcp
+            // URL) не делят файл кэша; `tools --refresh` работает как раньше.
+            let mut discovery = ToolDiscovery::for_endpoint(client.config.mcp_url.as_deref());
             let mapping = if *refresh {
                 discovery.tools_refresh(client)?
             } else {
