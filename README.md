@@ -5,6 +5,23 @@
 
 Проект написан на Rust и собирается в один бинарник без отдельного сервиса.
 
+## Установка / обновление
+
+Одна и та же команда ставит с нуля и обновляет (бинарник пересобирается,
+старый бэкапится и откатывается при сбое; конфиг `~/.config/ha-cli/config.toml`
+не трогается):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MrUndead1996/ha_cli/main/install.sh | bash
+# или через wget:
+wget -qO- https://raw.githubusercontent.com/MrUndead1996/ha_cli/main/install.sh | bash
+```
+
+Требуются `git`, `cargo` и `~/.local/bin` в `PATH`. Для установки скилла
+OpenClaw добавь `-- --skills-root PATH`. Альтернатива — клонировать
+репозиторий и запустить `./install.sh` (при повторных запусках из клона
+он сам делает `git pull --ff-only` и пересобирает).
+
 ## Возможности
 
 - выполнение команд Home Assistant через intents;
