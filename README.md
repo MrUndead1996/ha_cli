@@ -1,33 +1,34 @@
-# Home Assistant CLI
+# ha-cli
 
-Небольшой CLI-клиент для управления Home Assistant через MCP
-(Assist или ha-mcp) и Home Assistant intents.
-
-Проект написан на Rust и собирается в один бинарник без отдельного сервиса.
+Лёгкий CLI-клиент для управления Home Assistant через сервер
+[ha-mcp](https://github.com/homeassistant-ai/ha-mcp) и Home Assistant
+intents. Написан на Rust, собирается в один бинарник.
 
 ## Установка / обновление
 
-Одна и та же команда ставит с нуля и обновляет (бинарник пересобирается,
-старый бэкапится и откатывается при сбое; конфиг `~/.config/ha-cli/config.toml`
-не трогается):
-
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MrUndead1996/ha_cli/main/install.sh | bash
-# или через wget:
-wget -qO- https://raw.githubusercontent.com/MrUndead1996/ha_cli/main/install.sh | bash
 ```
 
-Требуются `git`, `cargo` и `~/.local/bin` в `PATH`. Для установки скилла
-OpenClaw добавь `-- --skills-root PATH`. Альтернатива — клонировать
-репозиторий и запустить `./install.sh` (при повторных запусках из клона
-он сам делает `git pull --ff-only` и пересобирает).
+Для установки релиза нужны `curl`, `tar` и `sha256sum`; `git` и `cargo`
+нужны только для сборки из исходников. Добавь `~/.local/bin` в `PATH`
+или выбери каталог через `--install-dir PATH`.
+
+Отдельная установка скилла `ha-control`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MrUndead1996/ha_cli/main/install.sh | bash -s -- skill --skills-root PATH
+```
+
+Опции: `--install-dir PATH` — каталог для бинарника `ha` (укажи его
+и при установке скилла, если он нестандартный);
+`--skills-root PATH` — каталог скиллов. Сборка из исходников —
+`--build-from-source` (требует подтверждения; `--force` пропускает
+подтверждение).
 
 ## Возможности
 
 - выполнение команд Home Assistant через intents;
-- работа через встроенный Assist MCP endpoint или сервер
-  [ha-mcp](https://github.com/homeassistant-ai/ha-mcp) вместо прямой
-  работы с отдельными entity/service API;
 - простой CLI-интерфейс для скриптов, агентов и автоматизаций;
 - семантическое разрешение целей по `area` / `domain` / `name`;
   пользовательский `entity_id` отклоняется до любых сетевых запросов.
@@ -47,77 +48,37 @@ ha tools --refresh
 
 Селекторы — только семантические `area` / `domain` / `name`; сопоставление
 точное (регистр не учитывается, нечёткого «похожего» выбора нет). Ноль
-совпадений или неоднозначность — ошибка до вызова сервиса; цели не
-угадываются. Алиасы сущностей работают как значения `name`, алиасы
-областей при подключении к ha-mcp пока не поддерживаются — используй
-точные имена областей из `ha context --compact`.
-
-`ha intent` возвращает одну строку JSON с `ok`, `response_type`,
-`speech` и опциональным `data`. При работе через ha-mcp текст `speech`
-формируется заново и не обязан совпадать с прежним Assist-ответом
-побайтово. `ha context --raw` при подключении к ha-mcp выводит
-агрегированный ответ `ha_search` (новый формат), а не прежний текстовый
-`GetLiveContext`.
+совпадений или неоднозначность — ошибка до вызова сервиса. Алиасы
+сущностей работают как значения `name`; используй точные имена областей
+из `ha context --compact`.
 
 ## Конфигурация
 
-Для Assist нужны `HA_URL` и Long-Lived Access Token (`HA_TOKEN`). Для
-ha-mcp нужен полный `HA_MCP_URL`; токен администратора нужен при
-`HA_MCP_AUTH=ha_auth`, но не при режиме `none`.
+Файл `~/.config/ha-cli/config.toml` или переменные окружения. `.env`
+автоматически не загружается.
 
-Параметры могут передаваться через конфигурацию или переменные окружения.
-Файл `.env` CLI автоматически не загружает.
+- `mcp_url` (env `HA_MCP_URL`) — полный MCP endpoint ha-mcp. Путь URL
+  является секретом и не выводится в ошибках и debug-выводе.
+- `mcp_auth` (env `HA_MCP_AUTH`):
+  - `none` (по умолчанию) — токен не отправляется, секретный URL
+    авторизует запрос сам;
+  - `ha_auth` — отправлять `HA_TOKEN` Bearer-заголовком; требует
+    настроенный `mcp_url` и токен (`token_file`, файл 0600), иначе —
+    ошибка конфигурации до сетевых запросов.
+- Файл конфигурации с `mcp_url` или inline-токеном должен иметь права
+  0600 (проверяются). Прочие TOML-ключи: `token`, `token_file`,
+  `timeout`, `connect_timeout`.
 
-### Режим ha-mcp (`HA_MCP_URL`)
-
-`HA_MCP_URL` (TOML `mcp_url`) задаёт полный MCP endpoint вместо прежнего
-`HA_URL` + `/api/mcp/assist`. Путь URL является секретом (webhook
-`/api/webhook/<secret>` или прямой `/private_<secret>`) и не выводится в
-ошибках и debug-выводе.
-
-Авторизация настраивается переменной `HA_MCP_AUTH` (TOML `mcp_auth`):
-
-- `none` (по умолчанию) — токен **не** отправляется на `HA_MCP_URL`;
-  секретный URL авторизует запрос сам по себе. Наличие `HA_TOKEN`
-  в окружении само по себе не отправляет его на `HA_MCP_URL`.
-- `ha_auth` — явное разрешение отправлять `HA_TOKEN` Bearer-заголовком
-  на `HA_MCP_URL` (webhook-режим `ha_auth` с Long-Lived Access Token).
-  Требует настроенный `HA_MCP_URL` и токен, иначе — ошибка конфигурации
-  до сетевых запросов.
-
-Прежний Assist endpoint (без `mcp_url`) продолжает работать с Bearer
-`HA_TOKEN` как раньше. Приоритет `HA_MCP_AUTH`: env → TOML → `none`.
-Конфигурационный файл с inline-токеном или `mcp_url` должен иметь права
-0600 (проверяются; TOML-ключи: `url`, `mcp_url`, `mcp_auth`, `token`,
-`token_file`, `timeout`, `connect_timeout`).
-
-Пример конфигурации:
+Пример:
 
 ```toml
 mcp_url = "https://home.example.local/api/webhook/<secret>"
 mcp_auth = "ha_auth"   # или убери: секретный URL авторизует сам (none)
 token_file = "~/.config/ha-cli/token"  # обязателен при ha_auth; файл 0600
-# timeout = 60         # по умолчанию: 5 c для Assist, 60 c для ha-mcp
+# timeout = 60         # по умолчанию 60 c
 # connect_timeout = 5
 ```
 
-Таймауты: `timeout` (TOML) — общий таймаут исполнения запроса,
-`connect_timeout` — таймаут установки соединения. Явный `timeout`
-всегда имеет приоритет. Таймаут после отправки запроса не означает, что
-операция не выполнена — повторный вызов может сработать дважды.
-
-### Откат на Assist / старый бинарник
-
-CLI остаётся совместимым с прежним endpoint: чтобы откатиться, убери
-`mcp_url` из конфигурации (и `HA_MCP_URL` из окружения) — CLI вернётся
-к Assist `HA_URL` + `/api/mcp/assist` с Bearer `HA_TOKEN` и прежним
-таймаутом 5 секунд. Файл кэша инструментов привязан к endpoint
-(`~/.cache/ha-cli/tools-<endpoint>.json`, содержит только имена и схемы
-инструментов, без секретов), поэтому кэши Assist и ha-mcp не мешают
-друг другу. Полный откат — вернуть предыдущий бинарник и прежний
-конфигурационный файл. После возврата на Assist `context --raw` и текст
-`speech` снова используют формат Assist.
-
-## Назначение
-
-CLI предназначен как лёгкий интерфейс к Home Assistant для локальных AI-агентов и автоматизаций без необходимости использовать полный Home Assistant API напрямую.
+`timeout` — общий таймаут исполнения запроса. Таймаут после отправки
+запроса не означает, что операция не выполнена — повторный вызов может
+сработать дважды.

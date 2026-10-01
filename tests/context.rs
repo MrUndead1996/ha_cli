@@ -143,26 +143,11 @@ fn default_call_result() -> Json {
     json!({"content": [{"type": "text", "text": "Turned on"}], "isError": false})
 }
 
-fn make_client(transport: &MockTransport) -> Client {
-    let secrets = Secrets::new();
-    let config = Config {
-        url: Some("http://ha.test:8123".to_string()),
-        mcp_url: None,
-        mcp_auth: Default::default(),
-        token: String::new(),
-        timeout: 5,
-        connect_timeout: 5,
-    };
-    Client::new(config, Box::new(transport.clone()), &secrets)
-}
-
-/// Клиент с настроенным `mcp_url`: путь ha-mcp (ha_search вместо
-/// GetLiveContext).
+/// Клиент с настроенным `mcp_url`: путь ha-mcp (ha_search).
 fn make_mcp_client(transport: &MockTransport) -> Client {
     let secrets = Secrets::new();
     let config = Config {
-        url: None,
-        mcp_url: Some("http://ha.test/api/webhook/testsecret123".to_string()),
+        mcp_url: "http://ha.test/api/webhook/testsecret123".to_string(),
         mcp_auth: Default::default(),
         token: String::new(),
         timeout: 5,
@@ -670,7 +655,7 @@ fn ha_search_missing_tool_is_not_found_error() {
 }
 
 #[test]
-fn entity_from_raw_supports_ha_search_and_assist_shapes() {
+fn entity_from_raw_supports_ha_search_shape() {
     let ha = Entity::from_raw(&json!({
         "entity_id": "light.a",
         "friendly_name": "A",
@@ -682,7 +667,6 @@ fn entity_from_raw_supports_ha_search_and_assist_shapes() {
     .unwrap();
     assert_eq!(ha.name, "A");
     assert_eq!(ha.area, "Bathroom");
-    assert_eq!(ha.aliases, Vec::<String>::new());
     // Алиасы сущности сохраняются целиком (в т.ч. совпадающие с областью):
     // это алиасы сущности, а не области.
     assert_eq!(
@@ -691,110 +675,27 @@ fn entity_from_raw_supports_ha_search_and_assist_shapes() {
     );
     assert_eq!(ha.entity_id.as_deref(), Some("light.a"));
 
-    let assist = Entity::from_raw(&json!({
-        "name": "B",
+    // Область берётся как есть, без алиасов по запятой.
+    let plain = Entity::from_raw(&json!({
+        "friendly_name": "B",
         "domain": "switch",
-        "area": "Kitchen,Cooking",
+        "area": "Kitchen",
     }))
     .unwrap();
-    assert_eq!(assist.area, "Kitchen");
-    assert_eq!(assist.aliases, vec!["Cooking".to_string()]);
-    assert_eq!(assist.entity_id, None);
+    assert_eq!(plain.area, "Kitchen");
+    assert!(plain.entity_aliases.is_empty());
+    assert_eq!(plain.entity_id, None);
+    // Без area — Unknown; пустое friendly_name — запись отбрасывается.
+    assert_eq!(
+        Entity::from_raw(&json!({"friendly_name": "C", "domain": "light"}))
+            .unwrap()
+            .area,
+        "Unknown"
+    );
     assert!(Entity::from_raw(&json!({"friendly_name": ""})).is_none());
 }
 
 // ---------- get_live_context / refresh ----------
-
-#[test]
-fn get_live_context_namespace_independent() {
-    let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![json!({"name": "srv1__GetLiveContext"})]);
-    transport.push_call_result(
-        200,
-        json!({
-            "content": [{
-                "type": "text",
-                "text": r#"{"entities": [{"entity_id": "light.kitchen", "name": "Kitchen", "domain": "light", "area": "Kitchen"}]}"#,
-            }],
-            "isError": false,
-        }),
-    );
-    let mut client = make_client(&transport);
-
-    let live = context::get_live_context(&mut client).unwrap();
-
-    assert_eq!(live["entities"][0]["entity_id"], json!("light.kitchen"));
-    assert_eq!(
-        transport.tool_calls(),
-        vec![("srv1__GetLiveContext".to_string(), json!({}))],
-    );
-}
-
-#[test]
-fn get_live_context_prefers_structured_content() {
-    let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![json!({"name": "GetLiveContext"})]);
-    transport.push_call_result(
-        200,
-        json!({
-            "content": [{"type": "text", "text": r#"{"entities": []}"#}],
-            "isError": false,
-            "structuredContent": {"entities": [{"entity_id": "light.bed"}]},
-        }),
-    );
-    let mut client = make_client(&transport);
-
-    let live = context::get_live_context(&mut client).unwrap();
-
-    assert_eq!(live, json!({"entities": [{"entity_id": "light.bed"}]}));
-}
-
-#[test]
-fn get_live_context_refreshes_stale_tool_name() {
-    let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![json!({"name": "old__GetLiveContext"})]);
-    // Прогрев кэша (аналог ToolDiscovery(tools_client(...)).tools()).
-    let mut client = make_client(&transport);
-    ha_cli::discovery::ToolDiscovery::new(None)
-        .tools(&mut client)
-        .unwrap();
-
-    let transport = MockTransport::new(vec![json!({"name": "homeassistant__GetLiveContext"})]);
-    transport.push_call_result(
-        200,
-        json!({
-            "isError": true,
-            "content": [{
-                "type": "text",
-                "text": r#"Error calling tool: Tool "old__GetLiveContext" not found"#,
-            }],
-        }),
-    );
-    transport.push_call_result(
-        200,
-        json!({
-            "isError": false,
-            "content": [{"type": "text", "text": r#"{"entities": []}"#}],
-        }),
-    );
-    let mut client = make_client(&transport);
-
-    let live = context::get_live_context(&mut client).unwrap();
-
-    assert_eq!(live, json!({"entities": []}));
-    let names: Vec<String> = transport
-        .tool_calls()
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
-    assert_eq!(
-        names,
-        vec![
-            "old__GetLiveContext".to_string(),
-            "homeassistant__GetLiveContext".to_string(),
-        ]
-    );
-}
 
 // ---------- parse_live_context ----------
 
@@ -863,64 +764,6 @@ fn parse_is_error_without_text_falls_back_to_default_message() {
 }
 
 #[test]
-fn parse_current_home_assistant_yaml_envelope() {
-    let text = json!({
-        "success": true,
-        "result": "Live Context:\n- names: kitchen: light\n  domain: switch\n  state: 'off'\n  areas: kitchen\n  attributes:\n    device_class: outlet\n",
-    })
-    .to_string();
-
-    let parsed = context::parse_live_context(&json!({
-        "content": [{"type": "text", "text": text}],
-        "isError": false,
-    }))
-    .unwrap();
-
-    assert_eq!(
-        parsed,
-        json!({
-            "entities": [{
-                "name": "kitchen: light",
-                "area": "kitchen",
-                "domain": "switch",
-                "state": "off",
-                "capabilities": {"device_class": "outlet"},
-            }],
-        })
-    );
-}
-
-#[test]
-fn parse_current_context_with_first_entity_on_header_line() {
-    let text = json!({
-        "success": true,
-        "result": "Live Context: - names: kitchen light\n  domain: switch\n  state: 'off'\n  areas: kitchen",
-    })
-    .to_string();
-    let parsed = context::parse_live_context(&json!({
-        "content": [{"type": "text", "text": text}],
-        "isError": false,
-    }))
-    .unwrap();
-    assert_eq!(parsed["entities"][0]["name"], json!("kitchen light"));
-}
-
-#[test]
-fn parse_current_context_ignores_header_description() {
-    let text = json!({
-        "success": true,
-        "result": "Live Context: An overview of the smart home\n- names: kitchen light\n  domain: switch\n  state: 'off'",
-    })
-    .to_string();
-    let parsed = context::parse_live_context(&json!({
-        "content": [{"type": "text", "text": text}],
-        "isError": false,
-    }))
-    .unwrap();
-    assert_eq!(parsed["entities"][0]["name"], json!("kitchen light"));
-}
-
-#[test]
 fn parse_rejects_failed_home_assistant_envelope() {
     let text = r#"{"success": false, "result": "failed"}"#;
     let result = context::parse_live_context(&json!({
@@ -931,29 +774,6 @@ fn parse_rejects_failed_home_assistant_envelope() {
 }
 
 #[test]
-fn parse_rejects_non_text_wrapped_result() {
-    let result = context::parse_live_context(&json!({
-        "content": [{"type": "text", "text": r#"{"success": true, "result": 42}"#}],
-        "isError": false,
-    }));
-    let err = result.unwrap_err();
-    assert_eq!(err.message, "GetLiveContext result is not text");
-}
-
-#[test]
-fn parse_rejects_unknown_text_format() {
-    let result = context::parse_live_context(&json!({
-        "content": [{
-            "type": "text",
-            "text": r#"{"success": true, "result": "Something else entirely"}"#,
-        }],
-        "isError": false,
-    }));
-    let err = result.unwrap_err();
-    assert_eq!(err.message, "GetLiveContext result has an unknown format");
-}
-
-#[test]
 fn parse_returns_payload_without_envelope() {
     let parsed = context::parse_live_context(&json!({
         "content": [{"type": "text", "text": r#"{"entities": [{"name": "A"}]}"#}],
@@ -961,187 +781,6 @@ fn parse_returns_payload_without_envelope() {
     }))
     .unwrap();
     assert_eq!(parsed, json!({"entities": [{"name": "A"}]}));
-}
-
-// ---------- build_arguments ----------
-
-#[test]
-fn build_arguments_empty_schema() {
-    assert_eq!(context::build_arguments(&json!({})).unwrap(), json!({}));
-}
-
-#[test]
-fn build_arguments_uses_defaults() {
-    let schema = json!({
-        "properties": {"verbose": {"type": "boolean", "default": true}},
-    });
-    assert_eq!(
-        context::build_arguments(&schema).unwrap(),
-        json!({"verbose": true})
-    );
-}
-
-#[test]
-fn build_arguments_required_without_default_raises() {
-    let schema = json!({
-        "properties": {"name": {"type": "string"}},
-        "required": ["name"],
-    });
-    let err = context::build_arguments(&schema).unwrap_err();
-    assert_eq!(err.kind.as_str(), ErrorType::Context.as_str());
-    assert_eq!(
-        err.message,
-        "GetLiveContext requires argument 'name' with no default value"
-    );
-}
-
-#[test]
-fn build_arguments_non_object_properties() {
-    let schema = json!({"properties": "oops"});
-    assert_eq!(context::build_arguments(&schema).unwrap(), json!({}));
-}
-
-// ---------- Текстовый парсер ----------
-
-#[test]
-fn parser_multi_area_and_capabilities() {
-    let parsed = context::parse_live_context(&json!({
-        "content": [{
-            "type": "text",
-            "text": r#"{"success": true, "result": "Live Context:\n- names: kitchen light\n  domain: light\n  areas: Kitchen, Кухня\n  state: 'on'\n    friendly_name: Kitchen\n    brightness: 200\n- names: plug\n  areas: Kitchen\n  domain: switch"}"#,
-        }],
-        "isError": false,
-    }))
-    .unwrap();
-
-    assert_eq!(
-        parsed,
-        json!({
-            "entities": [
-                {
-                    "name": "kitchen light",
-                    "area": "Kitchen, Кухня",
-                    "domain": "light",
-                    "state": "on",
-                    "capabilities": {
-                        "friendly_name": "Kitchen",
-                        "brightness": "200",
-                    },
-                },
-                {
-                    "name": "plug",
-                    "area": "Kitchen",
-                    "domain": "switch",
-                    "state": null,
-                    "capabilities": {},
-                },
-            ],
-        })
-    );
-}
-
-#[test]
-fn parser_quoted_values_and_double_quotes() {
-    let parsed = context::parse_live_context(&json!({
-        "content": [{
-            "type": "text",
-            "text": r#"{"success": true, "result": "Live Context:\n- names: 'kitchen light'\n  state: \"off\"\n  domain: light"}"#,
-        }],
-        "isError": false,
-    }))
-    .unwrap();
-
-    assert_eq!(parsed["entities"][0]["name"], json!("kitchen light"));
-    assert_eq!(parsed["entities"][0]["state"], json!("off"));
-}
-
-#[test]
-fn parser_ignores_attributes() {
-    let parsed = context::parse_live_context(&json!({
-        "content": [{
-            "type": "text",
-            "text": r#"{"success": true, "result": "Live Context:\n- names: lamp\n  domain: light\n  areas: Kitchen\n  attributes:\n    supported: yes"}"#,
-        }],
-        "isError": false,
-    }))
-    .unwrap();
-
-    let entity = &parsed["entities"][0];
-    assert_eq!(entity["area"], json!("Kitchen"));
-    // Сам ключ attributes игнорируется, вложенные строки уходят в capabilities.
-    assert!(entity.get("attributes").is_none());
-    assert_eq!(entity["capabilities"], json!({"supported": "yes"}));
-}
-
-#[test]
-fn parser_skips_blank_lines() {
-    let parsed = context::parse_live_context(&json!({
-        "content": [{
-            "type": "text",
-            "text": r#"{"success": true, "result": "Live Context:\n\n- names: lamp\n\n  domain: light\n"}"#,
-        }],
-        "isError": false,
-    }))
-    .unwrap();
-
-    assert_eq!(parsed["entities"][0]["domain"], json!("light"));
-}
-
-#[test]
-fn parser_unknown_field_goes_to_capabilities() {
-    let parsed = context::parse_live_context(&json!({
-        "content": [{
-            "type": "text",
-            "text": r#"{"success": true, "result": "Live Context:\n- names: lamp\n  domain: light\n  color: warm"}"#,
-        }],
-        "isError": false,
-    }))
-    .unwrap();
-
-    assert_eq!(
-        parsed["entities"][0]["capabilities"],
-        json!({"color": "warm"})
-    );
-}
-
-#[test]
-fn parser_rejects_field_without_current_entity() {
-    let result = context::parse_live_context(&json!({
-        "content": [{
-            "type": "text",
-            "text": r#"{"success": true, "result": "Live Context: an overview\n  domain: light"}"#,
-        }],
-        "isError": false,
-    }));
-    let err = result.unwrap_err();
-    assert_eq!(err.message, "GetLiveContext entity has an unknown format");
-}
-
-#[test]
-fn parser_rejects_field_without_colon() {
-    let result = context::parse_live_context(&json!({
-        "content": [{
-            "type": "text",
-            "text": r#"{"success": true, "result": "Live Context:\n- names: lamp\n  broken line"}"#,
-        }],
-        "isError": false,
-    }));
-    let err = result.unwrap_err();
-    assert_eq!(err.message, "GetLiveContext field has an unknown format");
-}
-
-#[test]
-fn parser_empty_entities() {
-    let parsed = context::parse_live_context(&json!({
-        "content": [{
-            "type": "text",
-            "text": r#"{"success": true, "result": "Live Context:"}"#,
-        }],
-        "isError": false,
-    }))
-    .unwrap();
-
-    assert_eq!(parsed, json!({"entities": []}));
 }
 
 // ---------- normalize_entities ----------
@@ -1229,28 +868,6 @@ fn build_context_tolerates_bad_entities() {
 }
 
 #[test]
-fn build_context_splits_area_aliases() {
-    let built = context::build_context(&json!({
-        "entities": [{
-            "name": "light_livingroom",
-            "domain": "switch",
-            "area": "livingroom, hall, гостиная, зал",
-        }],
-    }));
-    assert_eq!(
-        built,
-        json!({
-            "areas": {
-                "livingroom": {"switch": ["light_livingroom"]},
-            },
-            "area_aliases": {
-                "livingroom": ["hall", "гостиная", "зал"],
-            },
-        })
-    );
-}
-
-#[test]
 fn build_context_deterministic_order_and_dedup() {
     let built = context::build_context(&json!({
         "entities": [
@@ -1277,18 +894,6 @@ fn build_context_deterministic_order_and_dedup() {
     assert_eq!(kitchen_domains, vec!["light"]);
     assert_eq!(areas["Kitchen"]["light"], json!(["A", "B"]));
     assert!(built.get("area_aliases").is_none());
-}
-
-#[test]
-fn build_context_aliases_sorted_and_deduped() {
-    let built = context::build_context(&json!({
-        "entities": [
-            {"name": "E", "domain": "switch", "area": "hall, зал, hall"},
-            {"name": "F", "domain": "switch", "area": "hall"},
-        ],
-    }));
-    assert_eq!(built["areas"]["hall"]["switch"], json!(["E", "F"]));
-    assert_eq!(built["area_aliases"], json!({"hall": ["зал"]}));
 }
 
 // ---------- compact_context / size_report ----------
@@ -1358,91 +963,6 @@ fn size_report_shape() {
     );
 }
 
-// ---------- query_state ----------
-
-#[test]
-fn query_state_matches_area_alias_and_semantic_name() {
-    let result = context::query_state(
-        &json!({
-            "entities": [{
-                "area": "kitchen, кухня",
-                "domain": "switch",
-                "name": "light_kitchen",
-                "state": "on",
-            }],
-        }),
-        &json!({"area": "КУХНЯ", "domain": "switch", "name": "light_kitchen"}),
-    )
-    .unwrap();
-    assert_eq!(
-        result,
-        json!({
-            "ok": true,
-            "response_type": "query_answer",
-            "speech": "light_kitchen: on",
-            "data": {
-                "states": [{
-                    "area": "kitchen",
-                    "domain": "switch",
-                    "name": "light_kitchen",
-                    "state": "on",
-                }],
-            },
-        })
-    );
-}
-
-#[test]
-fn query_state_requires_semantic_target() {
-    let err = context::query_state(&json!({"entities": []}), &json!({})).unwrap_err();
-    assert_eq!(err.kind.as_str(), ErrorType::InvalidArguments.as_str());
-}
-
-#[test]
-fn query_state_ignores_empty_string_selectors() {
-    // Пустая строка в Python falsy -> селектор не учитывается.
-    let err = context::query_state(&json!({"entities": []}), &json!({"area": ""})).unwrap_err();
-    assert_eq!(err.kind.as_str(), ErrorType::InvalidArguments.as_str());
-    // Строка из пробелов truthy -> селектор учитывается (нет совпадений).
-    let err = context::query_state(&json!({"entities": []}), &json!({"name": "   "})).unwrap_err();
-    assert_eq!(err.kind.as_str(), ErrorType::Intent.as_str());
-}
-
-#[test]
-fn query_state_reports_no_match() {
-    let err =
-        context::query_state(&json!({"entities": []}), &json!({"area": "kitchen"})).unwrap_err();
-    assert!(err.message.contains("no exposed entity"));
-    assert_eq!(err.kind.as_str(), ErrorType::Intent.as_str());
-}
-
-#[test]
-fn query_state_unknown_state_becomes_unknown_in_speech() {
-    let result = context::query_state(
-        &json!({"entities": [{"name": "lamp", "domain": "light", "area": "Kitchen"}]}),
-        &json!({"area": "kitchen"}),
-    )
-    .unwrap();
-    assert_eq!(result["speech"], json!("lamp: unknown"));
-    assert_eq!(result["data"]["states"][0]["state"], Json::Null);
-}
-
-#[test]
-fn query_state_matches_multiple_entities() {
-    let result = context::query_state(
-        &json!({
-            "entities": [
-                {"name": "A", "domain": "light", "area": "Kitchen", "state": "on"},
-                {"name": "B", "domain": "switch", "area": "Attic", "state": "off"},
-            ],
-        }),
-        &json!({"area": "Kitchen"}),
-    )
-    .unwrap();
-    assert_eq!(result["speech"], json!("A: on"));
-    assert_eq!(result["data"]["states"].as_array().unwrap().len(), 1);
-}
-
 // ---------- 2.4: ошибки без content и structured success:false ----------
 
 #[test]
@@ -1482,7 +1002,7 @@ fn parse_structured_success_false_without_error_has_default_message() {
         "structuredContent": {"success": false},
     }))
     .unwrap_err();
-    assert_eq!(err.message, "GetLiveContext reported failure");
+    assert_eq!(err.message, "context request reported failure");
 }
 
 #[test]
@@ -1515,21 +1035,8 @@ fn parse_text_success_false_with_result_still_fails() {
     }));
     assert_eq!(
         result.unwrap_err().message,
-        "GetLiveContext reported failure"
+        "context request reported failure"
     );
-}
-
-#[test]
-fn parse_legacy_success_true_envelope_still_unwraps() {
-    let parsed = context::parse_live_context(&json!({
-        "content": [{
-            "type": "text",
-            "text": r#"{"success": true, "result": "Live Context:\n- names: lamp\n  domain: light"}"#,
-        }],
-        "isError": false,
-    }))
-    .unwrap();
-    assert_eq!(parsed["entities"][0]["name"], json!("lamp"));
 }
 
 #[test]

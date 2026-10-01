@@ -3,25 +3,12 @@ use crate::errors::{ErrorType, HaCliError};
 use crate::security::Secrets;
 use serde_json::{json, Value as Json};
 
-pub const ASSIST_MCP_ENDPOINT: &str = "/api/mcp/assist";
 pub const PROTOCOL_VERSION: &str = "2025-03-26";
 
 /// Полный endpoint запроса: настроенный MCP URL используется как есть
-/// (webhook `/api/webhook/<secret>` или прямой `/private_<secret>`),
-/// иначе прежний Assist endpoint на базе `HA_URL`.
-pub fn resolve_endpoint(config: &Config) -> String {
-    match &config.mcp_url {
-        Some(mcp_url) => mcp_url.clone(),
-        None => format!(
-            "{}{}",
-            config
-                .url
-                .as_deref()
-                .unwrap_or_default()
-                .trim_end_matches('/'),
-            ASSIST_MCP_ENDPOINT
-        ),
-    }
+/// (webhook `/api/webhook/<secret>` или прямой `/private_<secret>`).
+pub fn resolve_endpoint(config: &Config) -> &str {
+    &config.mcp_url
 }
 
 /// Точка подмены транспорта в тестах (аналог httpx.BaseTransport).
@@ -93,7 +80,7 @@ impl Client {
         let headers = self.extra_headers();
         let response = self
             .transport
-            .post(&resolve_endpoint(&self.config), payload, &headers)
+            .post(resolve_endpoint(&self.config), payload, &headers)
             .map_err(|mut err| {
                 err.message = self.secrets.redact(&err.message);
                 err
@@ -342,20 +329,16 @@ impl HttpTransport {
 }
 
 /// Авторизация запроса:
-/// - Assist endpoint (`mcp_url` не задан) — Bearer `HA_TOKEN` как раньше;
-/// - `HA_MCP_URL` без `mcp_auth=ha_auth` — токен не отправляется,
-///   секретный URL авторизуется сам по себе;
-/// - `HA_MCP_URL` с явным `mcp_auth=ha_auth` — Bearer `HA_TOKEN`.
+/// - без `mcp_auth=ha_auth` токен не отправляется: секретный URL
+///   авторизуется сам по себе;
+/// - с явным `mcp_auth=ha_auth` — Bearer `HA_TOKEN`.
 pub fn auth_header(config: &Config) -> Option<String> {
     if config.token.is_empty() {
         return None;
     }
-    match config.mcp_url {
-        Some(_) => match config.mcp_auth {
-            McpAuth::HaAuth => Some(format!("Bearer {}", config.token)),
-            McpAuth::None => None,
-        },
-        None => Some(format!("Bearer {}", config.token)),
+    match config.mcp_auth {
+        McpAuth::HaAuth => Some(format!("Bearer {}", config.token)),
+        McpAuth::None => None,
     }
 }
 
@@ -367,7 +350,7 @@ impl Transport for HttpTransport {
         headers: &[(String, String)],
     ) -> Result<HttpResponse, HaCliError> {
         // Endpoint уже разрешён вызывающей стороной (resolve_endpoint):
-        // настроенный mcp_url используется как есть, без добавления пути Assist.
+        // настроенный mcp_url используется как есть.
         let mut request = self.http.post(url).json(payload);
         for (name, value) in headers {
             request = request.header(name, value);
@@ -525,10 +508,9 @@ mod tests {
         }
     }
 
-    fn config_from(mcp_url: Option<&str>, mcp_auth: McpAuth, token: &str) -> Config {
+    fn config_from(mcp_url: &str, mcp_auth: McpAuth, token: &str) -> Config {
         Config {
-            url: Some("http://ha.local".to_string()),
-            mcp_url: mcp_url.map(str::to_string),
+            mcp_url: mcp_url.to_string(),
             mcp_auth,
             token: token.to_string(),
             timeout: 5,
@@ -557,43 +539,25 @@ mod tests {
 
     #[test]
     fn mcp_url_default_sends_no_bearer() {
-        let config = config_from(
-            Some("http://ha.local/api/webhook/sec"),
-            McpAuth::None,
-            "tok",
-        );
+        let config = config_from("http://ha.local/api/webhook/sec", McpAuth::None, "tok");
         assert_eq!(auth_header(&config), None);
     }
 
     #[test]
     fn mcp_url_ha_auth_sends_bearer() {
-        let config = config_from(
-            Some("http://ha.local/api/webhook/sec"),
-            McpAuth::HaAuth,
-            "tok",
-        );
-        assert_eq!(auth_header(&config), Some("Bearer tok".to_string()));
-    }
-
-    #[test]
-    fn assist_endpoint_keeps_bearer() {
-        let config = config_from(None, McpAuth::None, "tok");
+        let config = config_from("http://ha.local/api/webhook/sec", McpAuth::HaAuth, "tok");
         assert_eq!(auth_header(&config), Some("Bearer tok".to_string()));
     }
 
     #[test]
     fn empty_token_never_authorizes() {
-        let config = config_from(None, McpAuth::None, "");
+        let config = config_from("http://ha.local/api/webhook/sec", McpAuth::None, "");
         assert_eq!(auth_header(&config), None);
     }
 
     #[test]
     fn request_to_mcp_url_has_no_authorization_by_default() {
-        let config = config_from(
-            Some("http://ha.local/api/webhook/sec"),
-            McpAuth::None,
-            "tok",
-        );
+        let config = config_from("http://ha.local/api/webhook/sec", McpAuth::None, "tok");
         let transport = SharedTransport::new();
         let mut client = Client::new(config, Box::new(transport.clone()), &Secrets::new());
         client.initialize().unwrap();
@@ -603,11 +567,7 @@ mod tests {
 
     #[test]
     fn request_to_mcp_url_with_ha_auth_sends_authorization() {
-        let config = config_from(
-            Some("http://ha.local/api/webhook/sec"),
-            McpAuth::HaAuth,
-            "tok",
-        );
+        let config = config_from("http://ha.local/api/webhook/sec", McpAuth::HaAuth, "tok");
         let transport = SharedTransport::new();
         let mut client = Client::new(config, Box::new(transport.clone()), &Secrets::new());
         client.initialize().unwrap();
@@ -615,18 +575,8 @@ mod tests {
     }
 
     #[test]
-    fn assist_request_keeps_authorization_and_endpoint() {
-        let config = config_from(None, McpAuth::None, "tok");
-        let transport = SharedTransport::new();
-        let mut client = Client::new(config, Box::new(transport.clone()), &Secrets::new());
-        client.initialize().unwrap();
-        assert_eq!(transport.authorization(), Some("Bearer tok".to_string()));
-        assert_eq!(transport.last_url(), "http://ha.local/api/mcp/assist");
-    }
-
-    #[test]
-    fn mcp_url_is_not_suffixed_with_assist_path() {
-        let config = config_from(Some("http://ha.local/private_secret"), McpAuth::None, "tok");
+    fn configured_url_is_used_as_is() {
+        let config = config_from("http://ha.local/private_secret", McpAuth::None, "tok");
         let transport = SharedTransport::new();
         let mut client = Client::new(config, Box::new(transport.clone()), &Secrets::new());
         client.initialize().unwrap();
@@ -635,11 +585,7 @@ mod tests {
 
     #[test]
     fn sse_initialize_and_tools_list_are_parsed_by_id() {
-        let config = config_from(
-            Some("http://ha.local/api/webhook/sec"),
-            McpAuth::HaAuth,
-            "tok",
-        );
+        let config = config_from("http://ha.local/api/webhook/sec", McpAuth::HaAuth, "tok");
         let transport = SharedTransport::new();
         transport.0.borrow_mut().response =
             sse_response(1, json!({"protocolVersion": "2025-03-26"}));
@@ -667,7 +613,7 @@ mod tests {
 
     #[test]
     fn notification_with_empty_202_body_is_accepted() {
-        let config = config_from(None, McpAuth::None, "tok");
+        let config = config_from("http://ha.local/api/webhook/sec", McpAuth::None, "tok");
         let transport = SharedTransport::new();
         transport.0.borrow_mut().response = empty_response(202);
         let mut client = Client::new(config, Box::new(transport.clone()), &Secrets::new());
@@ -676,7 +622,7 @@ mod tests {
 
     #[test]
     fn sse_event_without_matching_id_is_an_error() {
-        let config = config_from(None, McpAuth::None, "tok");
+        let config = config_from("http://ha.local/api/webhook/sec", McpAuth::None, "tok");
         let transport = SharedTransport::new();
         transport.0.borrow_mut().response = sse_response(99, json!({}));
         let mut client = Client::new(config, Box::new(transport.clone()), &Secrets::new());
@@ -687,7 +633,7 @@ mod tests {
 
     #[test]
     fn malformed_sse_is_a_sanitized_error() {
-        let config = config_from(None, McpAuth::None, "tok");
+        let config = config_from("http://ha.local/api/webhook/sec", McpAuth::None, "tok");
         let transport = SharedTransport::new();
         transport.0.borrow_mut().response = HttpResponse {
             status: 200,
@@ -703,7 +649,7 @@ mod tests {
 
     #[test]
     fn json_response_with_mismatched_id_is_rejected() {
-        let config = config_from(None, McpAuth::None, "tok");
+        let config = config_from("http://ha.local/api/webhook/sec", McpAuth::None, "tok");
         let transport = SharedTransport::new();
         transport.0.borrow_mut().response = HttpResponse {
             status: 200,
@@ -808,7 +754,7 @@ mod tests {
         let init = sse_raw(1, "{\"protocolVersion\":\"2025-03-26\"}");
         let tools = sse_raw(2, "{\"tools\":[{\"name\":\"ha_search\"}]}");
         let (url, seen) = serve_responses(vec![init, ACCEPTED_RESPONSE.to_string(), tools]);
-        let config = config_from(Some(&url), McpAuth::None, "");
+        let config = config_from(&url, McpAuth::None, "");
         let transport = HttpTransport::new(&config).unwrap();
         let mut client = Client::new(config, Box::new(transport), &Secrets::new());
         let tools = client.tools_list().unwrap();
@@ -832,7 +778,7 @@ mod tests {
         let (url, _seen) = serve_responses(vec![
             "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".to_string(),
         ]);
-        let config = config_from(Some(&url), McpAuth::None, "");
+        let config = config_from(&url, McpAuth::None, "");
         let transport = HttpTransport::new(&config).unwrap();
         let mut client = Client::new(config, Box::new(transport), &Secrets::new());
         let err = client.call("tools/list", None).unwrap_err();
@@ -857,7 +803,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_secs(2));
             sock.write_all(b"{}").ok();
         });
-        let mut config = config_from(Some(&format!("http://{addr}/")), McpAuth::None, "");
+        let mut config = config_from(&format!("http://{addr}/"), McpAuth::None, "");
         config.timeout = 1;
         config.connect_timeout = 1;
         let transport = HttpTransport::new(&config).unwrap();

@@ -1,5 +1,5 @@
-# Манифест скилла OpenClaw. Обрабатывается инсталлятором
-# (install.sh --skills-root PATH), не самим OpenClaw: агент читает
+# Манифест скилла. Обрабатывается инсталлятором
+# (install.sh skill --skills-root PATH), не агентом: агент читает
 # только SKILL.md рядом с этим файлом.
 schema = "openclaw-skill/v1"
 
@@ -10,7 +10,7 @@ description = "Управляй устройствами Home Assistant чере
 
 [install]
 # Файлы, которые инсталлятор копирует в <SKILLS_ROOT>/ha-control/.
-# Плейсхолдер {{HA_BIN}} в SKILL.md заменяется на shell-экранированный
-# абсолютный путь к установленному бинарнику CLI.
+# Плейсхолдер {{HA_BIN}} в SKILL.md заменяется на абсолютный путь
+# к установленному бинарнику CLI.
 files = ["SKILL.md", "SKILL.toml"]
 template = "SKILL.md"
