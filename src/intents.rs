@@ -159,14 +159,16 @@ fn read_states_for_targets(client: &mut Client, entities: &[Entity]) -> Result<J
             let tool = find_tool(&mapping, HA_GET_STATE_TOOL)?;
             result = client.tools_call(&tool.mcp_name, &arguments)?;
         }
-        let state = read_live_state(&result)?;
+        let (state, attributes) = read_live_state(&result)?;
         // Порядок ключей важен для паритета вывода с Python-версией;
-        // entity_id в вывод не попадает.
+        // entity_id в вывод не попадает. `attributes` — сквозной объект
+        // от ha_get_state; отсутствует у сервера → пустой объект.
         let mut item = Map::new();
         item.insert("area".to_string(), Json::String(entity.area.clone()));
         item.insert("domain".to_string(), Json::String(entity.domain.clone()));
         item.insert("name".to_string(), Json::String(entity.name.clone()));
         item.insert("state".to_string(), Json::String(state.clone()));
+        item.insert("attributes".to_string(), attributes);
         speech_parts.push(format!("{}: {}", entity.name, state));
         states.push(Json::Object(item));
     }
@@ -184,7 +186,9 @@ fn read_states_for_targets(client: &mut Client, entities: &[Entity]) -> Result<J
 /// на одиночный вызов: непустые `errors`/`error_count` распространяются как
 /// ошибка, а `state` берётся только из единственного элемента `states`.
 /// Отсутствие или нестроковость `state` — fail-closed ошибка, а не `unknown`.
-fn read_live_state(result: &Json) -> Result<String, HaCliError> {
+/// Отсутствие `attributes` ошибкой НЕ считается: возвращается пустой
+/// объект `{}` (ключ `attributes` в выводе есть всегда).
+fn read_live_state(result: &Json) -> Result<(String, Json), HaCliError> {
     let intent_error = |message: &str| HaCliError::new(ErrorType::Intent, message.to_string());
     if !result.is_object() {
         return Err(intent_error("unexpected tool result type"));
@@ -225,26 +229,35 @@ fn read_live_state(result: &Json) -> Result<String, HaCliError> {
     if !errors_empty || error_count > 0 {
         return Err(intent_error("state request reported errors for the target"));
     }
-    let state = structured
+    let read_data = |data: &Json| -> Option<(String, Json)> {
+        let state = data.get("state").and_then(Json::as_str)?;
+        // Attributes — сквозной объект от сервера; отсутствует → {}.
+        let attributes = data
+            .get("attributes")
+            .cloned()
+            .unwrap_or_else(|| Json::Object(Map::new()));
+        Some((state.to_string(), attributes))
+    };
+    let parsed = structured
         .get("data")
-        .and_then(|data| data.get("state"))
-        .and_then(Json::as_str)
+        .and_then(&read_data)
         .or_else(|| {
             structured
                 .get("states")
                 .and_then(Json::as_array)
                 .filter(|states| states.len() == 1)
-                .and_then(|states| states[0].get("state"))
-                .and_then(Json::as_str)
+                .and_then(|states| states.first())
+                .and_then(&read_data)
         })
-        .filter(|state| !state.trim().is_empty());
-    match state {
-        Some(state) => Ok(state.to_string()),
+        .filter(|(state, _)| !state.trim().is_empty());
+    let (state, attributes) = match parsed {
+        Some(parsed) => parsed,
         // Неполные данные не выдаются за результат: fail-closed.
         None => Err(intent_error(
             "state request returned no valid state for the target",
-        )),
-    }
+        ))?,
+    };
+    Ok((state, attributes))
 }
 
 /// Этап 4.2: действия `HassTurnOn` / `HassTurnOff` / `HassLightSet` /
@@ -1005,6 +1018,8 @@ mod tests {
         assert_eq!(states[0]["area"], json!("Kitchen"));
         assert_eq!(states[0]["domain"], json!("light"));
         assert_eq!(states[0]["state"], json!("on"));
+        // Атрибуты сервера проходят в вывод сквозным объектом.
+        assert_eq!(states[0]["attributes"], json!({"friendly_name": "One"}));
         // Внутренний ID не отражается наружу.
         assert!(serde_json::to_string(&result)
             .unwrap()
@@ -1084,6 +1099,20 @@ mod tests {
         assert!(!err.message.contains("light.a"));
         assert!(!err.message.contains("light.b"));
         assert_eq!(mock.get_state_count(), 2);
+    }
+
+    #[test]
+    fn get_state_missing_attributes_are_empty_object_not_error() {
+        // Отсутствие attributes у сервера — не ошибка: в вывод попадает {}.
+        let reply = json!({"structuredContent": {
+            "data": {"state": "on"}, "metadata": {},
+        }});
+        let mock = std::rc::Rc::new(MockGetState::new(reply));
+        let mut client = get_state_client(&mock);
+        let result = execute(&mut client, "HassGetState", &json!({"name": "One"})).unwrap();
+        assert_eq!(result["data"]["states"][0]["state"], json!("on"));
+        assert_eq!(result["data"]["states"][0]["attributes"], json!({}));
+        assert_eq!(result["speech"], json!("One: on"));
     }
 
     #[test]

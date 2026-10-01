@@ -132,7 +132,9 @@ bound, fail-closed на malformed-записях — всё до любого ч
 `success:false` и отсутствие/нестроковость `state` — fail-closed ошибки
 (`intent_failed`), а не «unknown». Ответ собирается в прежнем конверте
 `ok`/`response_type:"query_answer"`/`speech`/`data.states` с семантическими
-именами area/domain/name; внутренние ID наружу не отражаются — scrub
+именами area/domain/name/state и сквозным объектом `attributes`
+(`data.attributes` сервера; отсутствует → пустой объект `{}`); внутренние
+ID наружу не отражаются — scrub
 по всем подготовленным целям применяется к ЛЮБОЙ ошибке после разрешения
 (ошибки JSON-RPC/транспорта от `tools_call`, stale-refresh и discovery
 включительно), так как текст сервера может отражать переданные ID.
