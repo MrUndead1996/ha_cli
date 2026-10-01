@@ -1,0 +1,41 @@
+#!/bin/bash
+# Mock curl for offline install.sh tests: maps URLs to files under fixtures/.
+FIX="$1"; BASE="$2"; shift 2
+ARGS=()
+URL=""
+OUT=""
+prev=""
+for a in "$@"; do
+	case "$prev" in
+	-o) OUT="$a" ;;
+	esac
+	case "$a" in
+	-fsSL | -fsS | -sS | -s | -f | -L | -o) ;;
+	-*) ;;
+	*) ARGS+=("$a") ;;
+	esac
+	prev="$a"
+done
+URL="${ARGS[0]}"
+case "$URL" in
+	https://api.github.com/repos/MrUndead1996/ha_cli/releases/latest)
+		URL="$BASE/api.json" ;;
+	https://github.com/MrUndead1996/ha_cli/releases/download/*)
+		URL="$BASE/dl/${URL##*/}" ;;
+	https://github.com/MrUndead1996/ha_cli/archive/refs/tags/*)
+		URL="$BASE/dl/${URL##*/}" ;;
+esac
+	case "$URL" in
+	"$BASE/api.json")
+		cat "$FIX/api.json" > "${OUT:-/dev/stdout}"
+	;;
+	*)
+		f="$FIX/${URL#"$BASE"/}"
+		if [ -f "$f" ]; then
+			cat "$f" > "${OUT:-/dev/stdout}"
+		else
+			echo "mock_curl: 404 $URL" >&2
+			exit 22
+		fi
+	;;
+esac
