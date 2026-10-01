@@ -1019,10 +1019,7 @@ mod tests {
         assert_eq!(states[0]["domain"], json!("light"));
         assert_eq!(states[0]["state"], json!("on"));
         // Атрибуты сервера проходят в вывод сквозным объектом.
-        assert_eq!(
-            states[0]["attributes"],
-            json!({"friendly_name": "One"})
-        );
+        assert_eq!(states[0]["attributes"], json!({"friendly_name": "One"}));
         // Внутренний ID не отражается наружу.
         assert!(serde_json::to_string(&result)
             .unwrap()
