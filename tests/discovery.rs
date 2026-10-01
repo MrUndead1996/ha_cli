@@ -2,8 +2,8 @@ use filetime::{set_file_mtime, FileTime};
 use ha_cli::client::{Client, HttpResponse, Transport};
 use ha_cli::config::Config;
 use ha_cli::discovery::{
-    default_cache_path, default_cache_path_for, discover_tools, endpoint_cache_id, get_tool,
-    is_stale_tool_result, load_cache, save_cache, ToolDiscovery, ASSIST_ENDPOINT_ID,
+    default_cache_path_for, discover_tools, endpoint_cache_id, get_tool, is_stale_tool_result,
+    load_cache, save_cache, ToolDiscovery,
 };
 use ha_cli::errors::{ErrorType, HaCliError};
 use ha_cli::security::Secrets;
@@ -84,8 +84,7 @@ fn fake_client(responses: Vec<Json>) -> (Client, MockTransport) {
     };
     let secrets = Secrets::new();
     let config = Config {
-        url: Some("http://ha.test:8123".to_string()),
-        mcp_url: None,
+        mcp_url: "http://ha.test:8123/api/webhook/test_secret".to_string(),
         mcp_auth: Default::default(),
         token: String::new(),
         timeout: 5,
@@ -93,6 +92,11 @@ fn fake_client(responses: Vec<Json>) -> (Client, MockTransport) {
     };
     let client = Client::new(config, Box::new(transport.clone()), &secrets);
     (client, transport)
+}
+
+/// mcp_url конфига fake_client (тот же endpoint при необходимости).
+fn config_endpoint_url() -> String {
+    "http://ha.test:8123/api/webhook/test_secret".to_string()
 }
 
 // ---------- discover_tools / get_tool ----------
@@ -130,7 +134,7 @@ fn required_semantic_names() {
         ("HassTurnOn", "intent__HassTurnOn"),
         ("HassTurnOff", "intent__HassTurnOff"),
         ("HassGetState", "intent__HassGetState"),
-        ("GetLiveContext", "homeassistant__GetLiveContext"),
+        ("ha_search", "ha_search"),
     ] {
         let mapping = discover_tools(vec![json!({"name": mcp_name})]);
         assert_eq!(get_tool(&mapping, basename).unwrap().mcp_name, mcp_name);
@@ -175,13 +179,17 @@ fn source_tools_preserved() {
 
 // ---------- save/load cache ----------
 
+fn test_endpoint_id() -> String {
+    endpoint_cache_id("http://ha.local/api/webhook/test_secret")
+}
+
 #[test]
 fn cache_roundtrip() {
     let tools = discover_tools(vec![json!({"name": "ns__HassTurnOn"})]);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tools.json");
-    save_cache(&tools, path.to_str().unwrap(), ASSIST_ENDPOINT_ID).unwrap();
-    let loaded = load_cache(path.to_str().unwrap(), ASSIST_ENDPOINT_ID).unwrap();
+    save_cache(&tools, path.to_str().unwrap(), &test_endpoint_id()).unwrap();
+    let loaded = load_cache(path.to_str().unwrap(), &test_endpoint_id()).unwrap();
     assert_eq!(
         get_tool(&loaded, "HassTurnOn").unwrap().mcp_name,
         "ns__HassTurnOn"
@@ -193,7 +201,7 @@ fn cache_file_permissions_0600() {
     let tools = discover_tools(vec![json!({"name": "ns__A"})]);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache").join("tools.json");
-    save_cache(&tools, path.to_str().unwrap(), ASSIST_ENDPOINT_ID).unwrap();
+    save_cache(&tools, path.to_str().unwrap(), &test_endpoint_id()).unwrap();
     let mode = std::fs::metadata(&path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600);
 }
@@ -204,10 +212,10 @@ fn load_cache_invalid_tools_field_errors() {
     let path = dir.path().join("tools.json");
     std::fs::write(
         &path,
-        json!({"endpoint": "assist", "tools": "nope"}).to_string(),
+        json!({"endpoint": "other-endpoint", "tools": "nope"}).to_string(),
     )
     .unwrap();
-    let err = load_cache(path.to_str().unwrap(), ASSIST_ENDPOINT_ID).unwrap_err();
+    let err = load_cache(path.to_str().unwrap(), &test_endpoint_id()).unwrap_err();
     assert_eq!(err.message, "invalid tool cache");
 }
 
@@ -219,12 +227,14 @@ fn discovery_uses_fresh_cache() {
     let path = dir.path().join("cache").join("tools.json");
 
     let (mut client, transport) = fake_client(vec![json!([{"name": "intent__HassTurnOn"}])]);
-    let mut discovery = ToolDiscovery::new(Some(path.to_string_lossy().into_owned()));
+    let mut discovery = ToolDiscovery::for_endpoint(&config_endpoint_url());
+    discovery.cache_path = path.to_string_lossy().into_owned();
     discovery.tools(&mut client).unwrap();
     assert_eq!(transport.calls(), 1);
 
     let (mut client2, transport2) = fake_client(vec![]);
-    let mut discovery2 = ToolDiscovery::new(Some(path.to_string_lossy().into_owned()));
+    let mut discovery2 = ToolDiscovery::for_endpoint(&config_endpoint_url());
+    discovery2.cache_path = path.to_string_lossy().into_owned();
     let mapping = discovery2.tools(&mut client2).unwrap();
     assert_eq!(
         get_tool(&mapping, "HassTurnOn").unwrap().mcp_name,
@@ -242,7 +252,8 @@ fn refresh_replaces_cache() {
         json!([{"name": "intent__HassTurnOn"}]),
         json!([{"name": "intent__HassTurnOff"}]),
     ]);
-    let mut discovery = ToolDiscovery::new(Some(path.to_string_lossy().into_owned()));
+    let mut discovery = ToolDiscovery::for_endpoint(&config_endpoint_url());
+    discovery.cache_path = path.to_string_lossy().into_owned();
     discovery.tools(&mut client).unwrap();
     let mapping = discovery.tools_refresh(&mut client).unwrap();
     assert_eq!(
@@ -258,11 +269,13 @@ fn missing_cached_tool_triggers_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tools.json");
     let (mut client, _) = fake_client(vec![json!([{"name": "intent__HassTurnOn"}])]);
-    let mut discovery = ToolDiscovery::new(Some(path.to_string_lossy().into_owned()));
+    let mut discovery = ToolDiscovery::for_endpoint(&config_endpoint_url());
+    discovery.cache_path = path.to_string_lossy().into_owned();
     discovery.tools(&mut client).unwrap();
 
     let (mut client2, transport2) = fake_client(vec![json!([{"name": "intent__HassGetState"}])]);
-    let mut discovery2 = ToolDiscovery::new(Some(path.to_string_lossy().into_owned()));
+    let mut discovery2 = ToolDiscovery::for_endpoint(&config_endpoint_url());
+    discovery2.cache_path = path.to_string_lossy().into_owned();
     let tool = discovery2.get_tool(&mut client2, "HassGetState").unwrap();
 
     assert_eq!(tool.mcp_name, "intent__HassGetState");
@@ -274,7 +287,8 @@ fn missing_tool_after_refresh_raises() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tools.json");
     let (mut client, transport2) = fake_client(vec![json!([{"name": "intent__HassTurnOn"}])]);
-    let mut discovery = ToolDiscovery::new(Some(path.to_string_lossy().into_owned()));
+    let mut discovery = ToolDiscovery::for_endpoint(&config_endpoint_url());
+    discovery.cache_path = path.to_string_lossy().into_owned();
     let err = discovery.get_tool(&mut client, "NoSuch").unwrap_err();
     assert_eq!(err.kind.as_str(), ErrorType::ToolNotFound.as_str());
     assert_eq!(transport2.calls(), 1);
@@ -285,13 +299,13 @@ fn invalid_cache_is_refreshed() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tools.json");
     std::fs::write(&path, "not json").unwrap();
-    let (mut client, transport) =
-        fake_client(vec![json!([{"name": "homeassistant__GetLiveContext"}])]);
-    let mut discovery = ToolDiscovery::new(Some(path.to_string_lossy().into_owned()));
+    let (mut client, transport) = fake_client(vec![json!([{"name": "ha_search"}])]);
+    let mut discovery = ToolDiscovery::for_endpoint(&config_endpoint_url());
+    discovery.cache_path = path.to_string_lossy().into_owned();
     let mapping = discovery.tools(&mut client).unwrap();
     assert_eq!(
-        get_tool(&mapping, "GetLiveContext").unwrap().mcp_name,
-        "homeassistant__GetLiveContext"
+        get_tool(&mapping, "ha_search").unwrap().mcp_name,
+        "ha_search"
     );
     assert_eq!(transport.calls(), 1);
 }
@@ -301,7 +315,8 @@ fn ttl_expiry_forces_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tools.json");
     let (mut client, _) = fake_client(vec![json!([{"name": "intent__HassTurnOn"}])]);
-    let mut discovery = ToolDiscovery::new(Some(path.to_string_lossy().into_owned()));
+    let mut discovery = ToolDiscovery::for_endpoint(&config_endpoint_url());
+    discovery.cache_path = path.to_string_lossy().into_owned();
     discovery.tools(&mut client).unwrap();
 
     // mtime 10 минут назад при TTL 300 c → кэш устарел.
@@ -316,7 +331,8 @@ fn ttl_expiry_forces_refresh() {
     set_file_mtime(Path::new(&path), stale).unwrap();
 
     let (mut client2, transport2) = fake_client(vec![json!([{"name": "intent__HassTurnOff"}])]);
-    let mut discovery2 = ToolDiscovery::new(Some(path.to_string_lossy().into_owned()));
+    let mut discovery2 = ToolDiscovery::for_endpoint(&config_endpoint_url());
+    discovery2.cache_path = path.to_string_lossy().into_owned();
     let mapping = discovery2.tools(&mut client2).unwrap();
     assert_eq!(
         get_tool(&mapping, "HassTurnOff").unwrap().mcp_name,
@@ -331,11 +347,13 @@ fn fresh_cache_within_ttl_is_used() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tools.json");
     let (mut client, _) = fake_client(vec![json!([{"name": "intent__HassTurnOn"}])]);
-    let mut discovery = ToolDiscovery::new(Some(path.to_string_lossy().into_owned()));
+    let mut discovery = ToolDiscovery::for_endpoint(&config_endpoint_url());
+    discovery.cache_path = path.to_string_lossy().into_owned();
     discovery.tools(&mut client).unwrap();
 
     let (mut client2, transport2) = fake_client(vec![]);
-    let mut discovery2 = ToolDiscovery::new(Some(path.to_string_lossy().into_owned()));
+    let mut discovery2 = ToolDiscovery::for_endpoint(&config_endpoint_url());
+    discovery2.cache_path = path.to_string_lossy().into_owned();
     discovery2.tools(&mut client2).unwrap();
     assert_eq!(transport2.calls(), 0);
 }
@@ -345,41 +363,27 @@ fn fresh_cache_within_ttl_is_used() {
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
-fn default_cache_path_uses_xdg_cache_home() {
+fn default_cache_path_for_uses_xdg_cache_home() {
     let _guard = ENV_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("XDG_CACHE_HOME", dir.path().to_string_lossy().into_owned());
+    let id = endpoint_cache_id(SECRET_MCP_URL);
     assert_eq!(
-        default_cache_path(),
+        default_cache_path_for(&id),
         dir.path()
             .join("ha-cli")
-            .join("tools-assist.json")
+            .join(format!("tools-{id}.json"))
             .to_string_lossy()
     );
     std::env::remove_var("XDG_CACHE_HOME");
 }
 
 #[test]
-fn default_cache_path_defaults_to_home_cache() {
+fn default_cache_path_for_defaults_to_home_cache() {
     let _guard = ENV_LOCK.lock().unwrap();
     std::env::remove_var("XDG_CACHE_HOME");
     let home = std::env::var("HOME").unwrap();
-    assert_eq!(
-        default_cache_path(),
-        Path::new(&home)
-            .join(".cache")
-            .join("ha-cli")
-            .join("tools-assist.json")
-            .to_string_lossy()
-    );
-}
-
-#[test]
-fn default_cache_path_for_contains_endpoint_id_not_url() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::remove_var("XDG_CACHE_HOME");
-    let home = std::env::var("HOME").unwrap();
-    let id = endpoint_cache_id(Some("http://ha.local/api/webhook/verysecret"));
+    let id = endpoint_cache_id(SECRET_MCP_URL);
     assert!(id.starts_with("hamcp-"));
     let path = default_cache_path_for(&id);
     assert_eq!(
@@ -390,8 +394,9 @@ fn default_cache_path_for_contains_endpoint_id_not_url() {
             .join(format!("tools-{id}.json"))
             .to_string_lossy()
     );
-    assert!(!path.contains("verysecret"));
-    assert!(!path.contains("webhook"));
+    // Имя файла не содержит URL — только несекретный дайджест.
+    assert!(!path.contains("secretwebhook42"));
+    assert!(!path.contains("ha.local"));
 }
 
 // ---------- изоляция кэша по endpoint (этап 5.1) ----------
@@ -401,51 +406,13 @@ const OTHER_MCP_URL: &str = "http://other.local/private_othersecret77";
 
 #[test]
 fn endpoint_ids_differ_and_hide_secrets() {
-    let assist = endpoint_cache_id(None);
-    let mcp = endpoint_cache_id(Some(SECRET_MCP_URL));
-    let other = endpoint_cache_id(Some(OTHER_MCP_URL));
-    assert_eq!(assist, ASSIST_ENDPOINT_ID);
+    let mcp = endpoint_cache_id(SECRET_MCP_URL);
+    let other = endpoint_cache_id(OTHER_MCP_URL);
     assert_ne!(mcp, other);
-    assert_ne!(mcp, assist);
     // Дайджест не раскрывает секрет и стабилен (то же соединение — тот же кэш).
     assert!(!mcp.contains("secretwebhook42"));
     assert!(!mcp.contains("ha.local"));
-    assert_eq!(endpoint_cache_id(Some(SECRET_MCP_URL)), mcp);
-}
-
-/// Assist-кэш (в том числе переименованный legacy `Hass*` файл) не
-/// подставляется в ha-mcp-сессию: другой endpoint — другой файл.
-#[test]
-fn assist_cache_is_not_used_for_hamcp() {
-    let dir = tempfile::tempdir().unwrap();
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::set_var("XDG_CACHE_HOME", dir.path().to_string_lossy().into_owned());
-    let assist_path = dir.path().join("tools-assist.json");
-    let assist_tools = discover_tools(vec![json!({"name": "homeassistant__HassTurnOn"})]);
-    save_cache(
-        &assist_tools,
-        assist_path.to_str().unwrap(),
-        ASSIST_ENDPOINT_ID,
-    )
-    .unwrap();
-
-    let (mut client, transport) = fake_client(vec![json!([{"name": "ha_search"}])]);
-    let mut discovery = ToolDiscovery::for_endpoint(Some(SECRET_MCP_URL));
-    assert_eq!(
-        Path::new(&discovery.cache_path).file_name().unwrap(),
-        Path::new(&default_cache_path_for(&discovery.endpoint_id))
-            .file_name()
-            .unwrap()
-    );
-    let mapping = discovery.tools(&mut client).unwrap();
-    // Инструменты Assist не видны, инструменты ha-mcp взяты из сети.
-    assert!(get_tool(&mapping, "HassTurnOn").is_err());
-    assert_eq!(
-        get_tool(&mapping, "ha_search").unwrap().mcp_name,
-        "ha_search"
-    );
-    assert_eq!(transport.calls(), 1);
-    std::env::remove_var("XDG_CACHE_HOME");
+    assert_eq!(endpoint_cache_id(SECRET_MCP_URL), mcp);
 }
 
 /// Два разных ha-mcp endpoint'а не делят кэш друг с другом.
@@ -458,7 +425,7 @@ fn two_hamcp_endpoints_use_separate_caches() {
     std::env::set_var("XDG_CACHE_HOME", xdg);
 
     let (mut client_a, _transport_a) = fake_client(vec![json!([{"name": "ha_search"}])]);
-    let mut discovery_a = ToolDiscovery::for_endpoint(Some(SECRET_MCP_URL));
+    let mut discovery_a = ToolDiscovery::for_endpoint(SECRET_MCP_URL);
     discovery_a.cache_path = cache_dir
         .join(format!("tools-{}.json", discovery_a.endpoint_id))
         .to_string_lossy()
@@ -466,7 +433,7 @@ fn two_hamcp_endpoints_use_separate_caches() {
     discovery_a.tools(&mut client_a).unwrap();
 
     let (mut client_b, transport_b) = fake_client(vec![json!([{"name": "ha_get_state"}])]);
-    let mut discovery_b = ToolDiscovery::for_endpoint(Some(OTHER_MCP_URL));
+    let mut discovery_b = ToolDiscovery::for_endpoint(OTHER_MCP_URL);
     discovery_b.cache_path = cache_dir
         .join(format!("tools-{}.json", discovery_b.endpoint_id))
         .to_string_lossy()
@@ -498,7 +465,8 @@ fn legacy_cache_without_endpoint_is_isolated() {
     .unwrap();
 
     let (mut client, transport) = fake_client(vec![json!([{"name": "ha_search"}])]);
-    let mut discovery = ToolDiscovery::new(Some(path.to_string_lossy().into_owned()));
+    let mut discovery = ToolDiscovery::for_endpoint(SECRET_MCP_URL);
+    discovery.cache_path = path.to_string_lossy().into_owned();
     let mapping = discovery.tools(&mut client).unwrap();
     assert_eq!(transport.calls(), 1);
     assert!(get_tool(&mapping, "HassTurnOn").is_err());
@@ -507,21 +475,22 @@ fn legacy_cache_without_endpoint_is_isolated() {
         "ha_search"
     );
     // Перезаписанный кэш теперь привязан к endpoint.
-    assert!(load_cache(path.to_str().unwrap(), ASSIST_ENDPOINT_ID).is_ok());
+    assert!(load_cache(path.to_str().unwrap(), &endpoint_cache_id(SECRET_MCP_URL)).is_ok());
 }
 
-/// Кэш с ЧУЖИМ endpoint ( Assist-файл, подсунутый по пути ha-mcp ) не читается.
+/// Кэш с ЧУЖИМ endpoint (файл другого сервера, подсунутый по пути) не читается.
 #[test]
 fn cache_with_foreign_endpoint_is_rejected() {
-    let tools = discover_tools(vec![json!({"name": "homeassistant__HassTurnOn"})]);
+    let tools = discover_tools(vec![json!({"name": "ha_search"})]);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tools.json");
-    save_cache(&tools, path.to_str().unwrap(), ASSIST_ENDPOINT_ID).unwrap();
-    let err = load_cache(
+    save_cache(
+        &tools,
         path.to_str().unwrap(),
-        &endpoint_cache_id(Some(SECRET_MCP_URL)),
+        &endpoint_cache_id(OTHER_MCP_URL),
     )
-    .unwrap_err();
+    .unwrap();
+    let err = load_cache(path.to_str().unwrap(), &endpoint_cache_id(SECRET_MCP_URL)).unwrap_err();
     assert_eq!(err.message, "invalid tool cache");
 }
 
@@ -531,8 +500,8 @@ fn cache_path_and_content_contain_no_plaintext_url() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache").join("tools.json");
     let (mut client, _) = fake_client(vec![json!([{"name": "ha_search"}])]);
-    let mut discovery = ToolDiscovery::new(Some(path.to_string_lossy().into_owned()));
-    discovery.endpoint_id = endpoint_cache_id(Some(SECRET_MCP_URL));
+    let mut discovery = ToolDiscovery::for_endpoint(SECRET_MCP_URL);
+    discovery.cache_path = path.to_string_lossy().into_owned();
     discovery.tools(&mut client).unwrap();
 
     let name = Path::new(&discovery.cache_path)
@@ -558,7 +527,8 @@ fn disabled_tool_after_refresh_is_not_found() {
         {"name": "ha_search"},
         {"name": "ha_call_service"},
     ])]);
-    let mut discovery = ToolDiscovery::new(Some(path.to_string_lossy().into_owned()));
+    let mut discovery = ToolDiscovery::for_endpoint(SECRET_MCP_URL);
+    discovery.cache_path = path.to_string_lossy().into_owned();
     discovery.tools(&mut client).unwrap();
 
     // Кэш устаревает (TTL истёк), сервер отключил ha_call_service:
@@ -574,7 +544,8 @@ fn disabled_tool_after_refresh_is_not_found() {
     set_file_mtime(Path::new(&path), stale).unwrap();
 
     let (mut client2, transport2) = fake_client(vec![json!([{"name": "ha_search"}])]);
-    let mut discovery2 = ToolDiscovery::new(Some(path.to_string_lossy().into_owned()));
+    let mut discovery2 = ToolDiscovery::for_endpoint(SECRET_MCP_URL);
+    discovery2.cache_path = path.to_string_lossy().into_owned();
     let err = discovery2
         .get_tool(&mut client2, "ha_call_service")
         .unwrap_err();
@@ -589,9 +560,9 @@ fn refresh_writes_endpoint_bound_cache() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tools.json");
     let (mut client, _) = fake_client(vec![json!([{"name": "ha_search"}])]);
-    let mut discovery = ToolDiscovery::new(Some(path.to_string_lossy().into_owned()));
-    let id = endpoint_cache_id(Some(SECRET_MCP_URL));
-    discovery.endpoint_id = id.clone();
+    let mut discovery = ToolDiscovery::for_endpoint(SECRET_MCP_URL);
+    discovery.cache_path = path.to_string_lossy().into_owned();
+    let id = discovery.endpoint_id.clone();
     let mapping = discovery.tools_refresh(&mut client).unwrap();
     assert_eq!(
         get_tool(&mapping, "ha_search").unwrap().mcp_name,

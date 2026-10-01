@@ -1,5 +1,4 @@
 use crate::client::Client;
-use crate::context;
 use crate::discovery::{get_tool as find_tool, is_stale_tool_result, ToolDiscovery};
 use crate::errors::{ErrorType, HaCliError};
 use crate::models::Entity;
@@ -62,55 +61,26 @@ pub fn execute(client: &mut Client, intent: &str, payload: &Json) -> Result<Json
     if let Err(message) = security::validate_entity_payload(payload) {
         return Err(HaCliError::new(ErrorType::InvalidArguments, message));
     }
-    // Этап 3.3 (docs/mcp_migration.md): на ha-mcp (`mcp_url` задан)
     // HassGetState разрешается строго по отфильтрованному каталогу
     // `ha_search`, состояние читается `ha_get_state` по внутренним ID.
-    // Прочие действия после разрешения возвращают «not implemented yet» —
-    // путь исполнения (ha_call_service) появится на этапе 4.
-    // Assist endpoint без `mcp_url` работает как раньше.
-    if client.config.mcp_url.is_some() {
-        // Этап 4.1: строгая интент-специфичная валидация payload
-        // (allowlist ключей, типы, диапазоны, сочетания, домен по
-        // селектору) — ДО любых сетевых вызовов, включая
-        // `resolver::prepare_action` и `ha_get_state`.
-        if let Err(message) = security::validate_intent_payload(intent, payload) {
-            return Err(HaCliError::new(ErrorType::InvalidArguments, message));
-        }
-        if intent == "HassGetState" {
-            return execute_hamcp_get_state(client, payload);
-        }
-        // Этап 4.2: действия отображаются на `ha_call_service`. Полный
-        // набор целей разрешается ДО первого вызова сервиса
-        // (`prepare_action`: рекурсивный запрет entity_id, семантические
-        // селекторы, bound, fail-closed на malformed-записях); домен каждой
-        // цели проверяется по интенту; затем — по одному
-        // `ha_call_service` на цель с одиночным внутренним ID.
-        let prepared = resolver::prepare_action(client, payload)?;
-        return execute_hamcp_action(client, intent, payload, &prepared);
+    // Этап 4.1: строгая интент-специфичная валидация payload
+    // (allowlist ключей, типы, диапазоны, сочетания, домен по
+    // селектору) — ДО любых сетевых вызовов, включая
+    // `resolver::prepare_action` и `ha_get_state`.
+    if let Err(message) = security::validate_intent_payload(intent, payload) {
+        return Err(HaCliError::new(ErrorType::InvalidArguments, message));
     }
-    let mut discovery = ToolDiscovery::for_endpoint(client.config.mcp_url.as_deref());
-    let tool = match discovery.get_tool(client, intent) {
-        Ok(tool) => tool,
-        Err(err) => {
-            if !matches!(err.kind, ErrorType::ToolNotFound) {
-                return Err(err);
-            }
-            if intent != "HassGetState" {
-                return Err(err);
-            }
-            let live_context = context::get_live_context(client)?;
-            return context::query_state(&live_context, payload);
-        }
-    };
-    let arguments = normalize_arguments(payload, &tool.input_schema);
-    let mut result = client.tools_call(&tool.mcp_name, &arguments)?;
-    if is_stale_tool_result(&result) {
-        let mapping = discovery.refresh(client)?;
-        let tool = find_tool(&mapping, intent)?;
-        let arguments = normalize_arguments(payload, &tool.input_schema);
-        result = client.tools_call(&tool.mcp_name, &arguments)?;
+    if intent == "HassGetState" {
+        return execute_hamcp_get_state(client, payload);
     }
-    normalize_result(&result)
+    // Этап 4.2: действия отображаются на `ha_call_service`. Полный
+    // набор целей разрешается ДО первого вызова сервиса
+    // (`prepare_action`: рекурсивный запрет entity_id, семантические
+    // селекторы, bound, fail-closed на malformed-записях); домен каждой
+    // цели проверяется по интенту; затем — по одному
+    // `ha_call_service` на цель с одиночным внутренним ID.
+    let prepared = resolver::prepare_action(client, payload)?;
+    execute_hamcp_action(client, intent, payload, &prepared)
 }
 
 /// Этап 3.3: `HassGetState` на ha-mcp. Цели разрешаются строго по полному
@@ -144,7 +114,7 @@ fn execute_hamcp_get_state(client: &mut Client, payload: &Json) -> Result<Json, 
 /// Кэш схем и stale-refresh разрешены: ha_get_state — read-only, повторный
 /// вызов не может выполнить действие дважды.
 fn read_states_for_targets(client: &mut Client, entities: &[Entity]) -> Result<Json, HaCliError> {
-    let mut discovery = ToolDiscovery::for_endpoint(client.config.mcp_url.as_deref());
+    let mut discovery = ToolDiscovery::for_endpoint(&client.config.mcp_url);
     let tool = discovery.get_tool(client, HA_GET_STATE_TOOL)?;
     let mut states = Vec::new();
     let mut speech_parts = Vec::new();
@@ -295,7 +265,7 @@ fn execute_hamcp_action(
     let plan = service_plan(intent, payload, &entities[0])?;
     // Поиск инструмента до первого вызова; кэш схем — только read-only
     // discovery, повторной отправки действия он не вызывает.
-    let mut discovery = ToolDiscovery::for_endpoint(client.config.mcp_url.as_deref());
+    let mut discovery = ToolDiscovery::for_endpoint(&client.config.mcp_url);
     let tool = discovery.get_tool(client, HA_CALL_SERVICE_TOOL)?;
     for (performed, entity) in entities.iter().enumerate() {
         // Имя домена для TurnOn/Off — домен самой цели (проверен
@@ -599,115 +569,6 @@ fn scrub_internal_ids(message: &str, entities: &[Entity]) -> String {
     message
 }
 
-/// Перенос `normalize_result`.
-pub fn normalize_result(result: &Json) -> Result<Json, HaCliError> {
-    let intent_error = |message: &str| HaCliError::new(ErrorType::Intent, message.to_string());
-    if !result.is_object() {
-        return Err(intent_error("unexpected tool result type"));
-    }
-    // Ошибки инструмента проверяются ДО требования content: структурированная
-    // ToolError или `{success:false}` без content — настоящая ошибка, а не
-    // generic «нет content».
-    if truthy(result.get("isError")) {
-        return Err(intent_error(&tool_error_message(
-            result,
-            "intent execution failed",
-        )));
-    }
-    if let Some(message) = result
-        .get("structuredContent")
-        .and_then(|value| success_failure_message(value, "tool reported failure"))
-    {
-        return Err(intent_error(&message));
-    }
-    // Нормальные результаты по-прежнему обязаны иметь content
-    // (обратная совместимость с контрактом Assist).
-    if !result.get("content").is_some_and(Json::is_array) {
-        return Err(intent_error("tool result has no content"));
-    }
-    let text = extract_text(result);
-    let intent_response = parse_intent_response(&text);
-    if let Some(message) = success_failure_message(&intent_response, "tool reported failure") {
-        return Err(intent_error(&message));
-    }
-    let speech_value = intent_response
-        .get("speech")
-        .cloned()
-        .unwrap_or_else(|| Json::String(text));
-    // Порядок ключей важен для паритета вывода с Python-версией
-    // (serde_json с preserve_order сохраняет порядок вставки).
-    let mut normalized = Map::new();
-    normalized.insert("ok".to_string(), Json::Bool(true));
-    normalized.insert(
-        "response_type".to_string(),
-        intent_response
-            .get("response_type")
-            .cloned()
-            .unwrap_or_else(|| Json::String("action_done".to_string())),
-    );
-    normalized.insert(
-        "speech".to_string(),
-        Json::String(extract_speech(&speech_value)),
-    );
-    let structured = match result.get("structuredContent") {
-        Some(value) => value.clone(),
-        None => intent_response.get("data").cloned().unwrap_or(Json::Null),
-    };
-    if !structured.is_null() {
-        normalized.insert("data".to_string(), structured);
-    }
-    Ok(Json::Object(normalized))
-}
-
-/// Перенос `_normalize_arguments`: строка оборачивается в массив,
-/// если схема инструмента ожидает array для этого ключа.
-pub fn normalize_arguments(payload: &Json, input_schema: &Json) -> Json {
-    let properties = input_schema.get("properties").and_then(Json::as_object);
-    let mut arguments = Map::new();
-    if let Some(object) = payload.as_object() {
-        for (key, value) in object {
-            let expects_array = properties
-                .and_then(|props| props.get(key))
-                .and_then(|spec| spec.get("type"))
-                .and_then(Json::as_str)
-                == Some("array");
-            let wrapped = matches!(value, Json::String(_)) && expects_array;
-            arguments.insert(
-                key.clone(),
-                if wrapped {
-                    json!([value])
-                } else {
-                    value.clone()
-                },
-            );
-        }
-    }
-    Json::Object(arguments)
-}
-
-/// Перенос `_parse_intent_response`.
-fn parse_intent_response(text: &str) -> Json {
-    serde_json::from_str(text)
-        .ok()
-        .filter(Json::is_object)
-        .unwrap_or_else(|| Json::Object(Map::new()))
-}
-
-/// Перенос `_extract_speech`.
-fn extract_speech(speech: &Json) -> String {
-    match speech {
-        Json::String(text) => text.clone(),
-        Json::Object(_) => speech
-            .get("plain")
-            .filter(|value| value.is_object())
-            .and_then(|plain| plain.get("speech"))
-            .and_then(Json::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        _ => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,8 +594,7 @@ mod tests {
 
     fn mcp_client() -> Client {
         let config = Config {
-            url: Some("http://ha.local".to_string()),
-            mcp_url: Some("http://ha.local/api/webhook/test".to_string()),
+            mcp_url: "http://ha.local/api/webhook/test".to_string(),
             mcp_auth: McpAuth::None,
             token: String::new(),
             timeout: 5,
@@ -985,8 +845,7 @@ mod tests {
 
     fn get_state_client(mock: &std::rc::Rc<MockGetState>) -> Client {
         let config = Config {
-            url: Some("http://ha.local".to_string()),
-            mcp_url: Some("http://ha.local/api/webhook/test".to_string()),
+            mcp_url: "http://ha.local/api/webhook/test".to_string(),
             mcp_auth: McpAuth::None,
             token: String::new(),
             timeout: 5,
@@ -1160,58 +1019,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn get_state_without_mcp_url_keeps_assist_fallback_path() {
-        // Assist endpoint: HassGetState не найден в tools/list → прежний
-        // fallback query_state по live context (без ha_get_state).
-        struct AssistMock;
-        impl Transport for AssistMock {
-            fn post(
-                &mut self,
-                _url: &str,
-                payload: &Json,
-                _headers: &[(String, String)],
-            ) -> Result<HttpResponse, HaCliError> {
-                let id = payload.get("id").and_then(Json::as_u64).unwrap_or(0);
-                match payload.get("method").and_then(Json::as_str) {
-                    Some("initialize") => Ok(reply(id, json!({"protocolVersion": "1.0"}))),
-                    Some("notifications/initialized") => Ok(HttpResponse {
-                        status: 202,
-                        headers: Vec::new(),
-                        body: String::new(),
-                    }),
-                    Some("tools/list") => {
-                        Ok(reply(id, json!({"tools": [{"name": "GetLiveContext"}]})))
-                    }
-                    Some("tools/call") => {
-                        let name = payload
-                            .pointer("/params/name")
-                            .and_then(Json::as_str)
-                            .unwrap_or("");
-                        assert_eq!(name, "GetLiveContext");
-                        Ok(reply(
-                            id,
-                            json!({"content": [{"type": "text", "text": json!({"success": true, "result": "Live Context:\n- names: One\n  areas: Kitchen\n  domain: light\n  state: off"}).to_string()}]}),
-                        ))
-                    }
-                    other => panic!("unexpected method: {other:?}"),
-                }
-            }
-        }
-        let config = Config {
-            url: Some("http://ha.local".to_string()),
-            mcp_url: None,
-            mcp_auth: McpAuth::None,
-            token: String::new(),
-            timeout: 5,
-            connect_timeout: 5,
-        };
-        let mut client = Client::new(config, Box::new(AssistMock), &Secrets::new());
-        let result = execute(&mut client, "HassGetState", &json!({"name": "One"})).unwrap();
-        assert_eq!(result["response_type"], json!("query_answer"));
-        assert_eq!(result["data"]["states"][0]["state"], json!("off"));
-    }
-
     /// Этап 4.2: скриптованный ha-mcp сервер для действий. Каталог
     /// (light.a/light.b/switch.c/automation.d в Kitchen), вызовы
     /// `ha_call_service` записываются для проверок домена/сервиса/data и
@@ -1381,8 +1188,7 @@ mod tests {
 
     fn action_client(mock: &std::rc::Rc<MockAction>) -> Client {
         let config = Config {
-            url: Some("http://ha.local".to_string()),
-            mcp_url: Some("http://ha.local/api/webhook/test".to_string()),
+            mcp_url: "http://ha.local/api/webhook/test".to_string(),
             mcp_auth: McpAuth::None,
             token: String::new(),
             timeout: 5,
@@ -1616,8 +1422,7 @@ mod tests {
         }
         let mock = std::rc::Rc::new(MockAction::new());
         let config = Config {
-            url: Some("http://ha.local".to_string()),
-            mcp_url: Some("http://ha.local/api/webhook/test".to_string()),
+            mcp_url: "http://ha.local/api/webhook/test".to_string(),
             mcp_auth: McpAuth::None,
             token: String::new(),
             timeout: 5,
@@ -1680,8 +1485,7 @@ mod tests {
         }
         let mock = std::rc::Rc::new(MockAction::new());
         let config = Config {
-            url: Some("http://ha.local".to_string()),
-            mcp_url: Some("http://ha.local/api/webhook/test".to_string()),
+            mcp_url: "http://ha.local/api/webhook/test".to_string(),
             mcp_auth: McpAuth::None,
             token: String::new(),
             timeout: 5,
@@ -1762,8 +1566,7 @@ mod tests {
         }
         let mock = std::rc::Rc::new(MockAction::new());
         let config = Config {
-            url: Some("http://ha.local".to_string()),
-            mcp_url: Some("http://ha.local/api/webhook/test".to_string()),
+            mcp_url: "http://ha.local/api/webhook/test".to_string(),
             mcp_auth: McpAuth::None,
             token: String::new(),
             timeout: 5,

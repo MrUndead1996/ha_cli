@@ -1,4 +1,4 @@
-use ha_cli::client::{auth_header, resolve_endpoint, Client, Transport, ASSIST_MCP_ENDPOINT};
+use ha_cli::client::{auth_header, resolve_endpoint, Client, Transport};
 use ha_cli::config::Config;
 use ha_cli::errors::{ErrorType, HaCliError};
 use ha_cli::security::Secrets;
@@ -91,8 +91,7 @@ fn make_client(transport: MockTransport) -> Client {
     make_client_with_config(
         transport,
         Config {
-            url: Some("http://ha.test:8123".to_string()),
-            mcp_url: None,
+            mcp_url: "http://ha.test:8123/api/webhook/test_secret".to_string(),
             mcp_auth: Default::default(),
             token: "secret".to_string(),
             timeout: 5,
@@ -104,9 +103,7 @@ fn make_client(transport: MockTransport) -> Client {
 fn make_client_with_config(transport: MockTransport, config: Config) -> Client {
     let mut secrets = Secrets::new();
     secrets.register("secret");
-    if let Some(mcp_url) = &config.mcp_url {
-        secrets.register(mcp_url);
-    }
+    secrets.register(&config.mcp_url);
     Client::new(config, Box::new(transport), &secrets)
 }
 
@@ -218,8 +215,7 @@ fn connection_error_from_transport() {
     secrets.register("secret");
     let mut client = Client::new(
         Config {
-            url: Some("http://ha.test:8123".to_string()),
-            mcp_url: None,
+            mcp_url: "http://ha.test:8123/api/webhook/test_secret".to_string(),
             mcp_auth: Default::default(),
             token: "secret".to_string(),
             timeout: 5,
@@ -385,24 +381,13 @@ fn stale_session_resent_on_each_request() {
 }
 
 #[test]
-fn assist_endpoint_appended_when_no_mcp_url() {
-    let transport = MockTransport::new(|_payload, _headers| (200, Vec::new(), String::new()));
-    let requests = transport.clone();
-    let mut client = make_client(transport);
-    client.notify("notifications/initialized", None).unwrap();
-    let reqs = requests.requests.lock().unwrap();
-    assert_eq!(reqs[0].url, "http://ha.test:8123/api/mcp/assist");
-}
-
-#[test]
 fn mcp_url_used_as_is_webhook() {
     let transport = MockTransport::new(|_payload, _headers| (200, Vec::new(), String::new()));
     let requests = transport.clone();
     let mut client = make_client_with_config(
         transport,
         Config {
-            url: Some("http://ha.test:8123".to_string()),
-            mcp_url: Some("http://ha.test:8123/api/webhook/wh_secret123".to_string()),
+            mcp_url: "http://ha.test:8123/api/webhook/wh_secret123".to_string(),
             mcp_auth: Default::default(),
             token: String::new(),
             timeout: 5,
@@ -412,7 +397,6 @@ fn mcp_url_used_as_is_webhook() {
     client.notify("notifications/initialized", None).unwrap();
     let reqs = requests.requests.lock().unwrap();
     assert_eq!(reqs[0].url, "http://ha.test:8123/api/webhook/wh_secret123");
-    assert!(!reqs[0].url.contains(ASSIST_MCP_ENDPOINT));
     assert!(!reqs[0]
         .headers
         .iter()
@@ -426,8 +410,7 @@ fn mcp_url_used_as_is_direct_private_path() {
     let mut client = make_client_with_config(
         transport,
         Config {
-            url: Some("http://ha.test:8123".to_string()),
-            mcp_url: Some("http://127.0.0.1:8123/private_prv_secret456".to_string()),
+            mcp_url: "http://127.0.0.1:8123/private_prv_secret456".to_string(),
             mcp_auth: Default::default(),
             token: String::new(),
             timeout: 5,
@@ -460,8 +443,7 @@ fn secret_mcp_url_redacted_in_transport_error() {
     secrets.register(&mcp_url);
     let mut client = Client::new(
         Config {
-            url: Some("http://ha.test:8123".to_string()),
-            mcp_url: Some(mcp_url),
+            mcp_url,
             mcp_auth: Default::default(),
             token: String::new(),
             timeout: 5,
@@ -476,28 +458,15 @@ fn secret_mcp_url_redacted_in_transport_error() {
 }
 
 #[test]
-fn auth_header_only_for_assist_endpoint() {
-    let assist = Config {
-        url: Some("http://ha.test:8123".to_string()),
-        mcp_url: None,
-        mcp_auth: Default::default(),
-        token: "ha-token".to_string(),
-        timeout: 5,
-        connect_timeout: 5,
-    };
-    assert_eq!(auth_header(&assist), Some("Bearer ha-token".to_string()));
-    assert_eq!(
-        resolve_endpoint(&assist),
-        "http://ha.test:8123/api/mcp/assist"
-    );
+fn auth_header_absent_without_ha_auth_and_endpoint_used_as_is() {
     let webhook = Config {
-        url: Some("http://ha.test:8123".to_string()),
-        mcp_url: Some("http://ha.test:8123/api/webhook/wh_s".to_string()),
+        mcp_url: "http://ha.test:8123/api/webhook/wh_s".to_string(),
         mcp_auth: Default::default(),
         token: "ha-token".to_string(),
         timeout: 5,
         connect_timeout: 5,
     };
+    // Секретный URL авторизуется сам по себе: Bearer не отправляется.
     assert_eq!(auth_header(&webhook), None);
     assert_eq!(
         resolve_endpoint(&webhook),
@@ -508,8 +477,7 @@ fn auth_header_only_for_assist_endpoint() {
 #[test]
 fn auth_header_ha_auth_opt_in_sends_token_to_mcp_url() {
     let webhook = Config {
-        url: Some("http://ha.test:8123".to_string()),
-        mcp_url: Some("http://ha.test:8123/api/webhook/wh_s".to_string()),
+        mcp_url: "http://ha.test:8123/api/webhook/wh_s".to_string(),
         mcp_auth: ha_cli::config::McpAuth::HaAuth,
         token: "ha-token".to_string(),
         timeout: 5,
@@ -535,8 +503,7 @@ fn json_rpc_error_message_is_redacted() {
         json_rpc_error(&format!("POST {webhook} failed for bearer sk_live_token"))
     });
     let config = Config {
-        url: Some("http://ha.test:8123".to_string()),
-        mcp_url: Some(webhook.to_string()),
+        mcp_url: webhook.to_string(),
         mcp_auth: Default::default(),
         token: String::new(),
         timeout: 5,
@@ -577,8 +544,7 @@ fn json_rpc_error_over_sse_is_ha_api_error_and_redacted() {
     secrets.register("sk_live_token");
     ha_cli::config::register_mcp_secrets(&mut secrets, "http://ha.local/private_s3cret");
     let config = Config {
-        url: Some("http://ha.test:8123".to_string()),
-        mcp_url: Some("http://ha.local/private_s3cret".to_string()),
+        mcp_url: "http://ha.local/private_s3cret".to_string(),
         mcp_auth: Default::default(),
         token: String::new(),
         timeout: 5,

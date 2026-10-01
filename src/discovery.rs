@@ -144,39 +144,22 @@ pub fn load_cache(cache_path: &str, endpoint_id: &str) -> Result<ToolMapping, Ha
     Ok(discover_tools(tools.clone()))
 }
 
-/// Идентификатор endpoint в имени и содержимом файла кэша для прежнего
-/// Assist сервера. Кэш ha-mcp использует отдельный идентификатор
-/// (`hamcp-<sha256>`), поэтому Assist-кэш с `Hass*` инструментами
-/// физически не может быть подставлен в ha-mcp-сессию.
-pub const ASSIST_ENDPOINT_ID: &str = "assist";
-
 /// Идентификатор endpoint для изоляции кэша схем инструментов
-/// (docs/mcp_migration.md, этап 5, подпункт 1): Assist — константа;
-/// ha-mcp — SHA-256 от ПОЛНОГО URL, включая секретный webhook path.
-/// Обоснование выбора дайджеста: в проекте ещё нет криптографического
-/// digest, а URL сам является секретом — детерминированный «дешёвый»
-/// отпечаток (длина, хост, CRC и т.п.) позволил бы перебором восстановить
-/// приватный URL; SHA-256 не раскрывает URL и не содержит секрета ни в
-/// каком виде, поэтому безопасен и в имени файла, и в содержимом кэша.
-/// Разные ha-mcp endpoint'ы (другой webhook/хост) получают разные файлы
-/// и не видят кэш друг друга.
-pub fn endpoint_cache_id(mcp_url: Option<&str>) -> String {
-    match mcp_url {
-        None => ASSIST_ENDPOINT_ID.to_string(),
-        Some(url) => {
-            let digest = Sha256::digest(url.as_bytes());
-            let mut hex = String::with_capacity(digest.len() * 2);
-            for byte in digest {
-                hex.push_str(&format!("{byte:02x}"));
-            }
-            format!("hamcp-{hex}")
-        }
+/// (docs/mcp_migration.md, этап 5, подпункт 1): SHA-256 от ПОЛНОГО URL,
+/// включая секретный webhook path. Обоснование выбора дайджеста: URL сам
+/// является секретом — детерминированный «дешёвый» отпечаток (длина, хост,
+/// CRC и т.п.) позволил бы перебором восстановить приватный URL; SHA-256
+/// не раскрывает URL и не содержит секрета ни в каком виде, поэтому
+/// безопасен и в имени файла, и в содержимом кэша. Разные ha-mcp
+/// endpoint'ы (другой webhook/хост) получают разные файлы и не видят кэш
+/// друг друга.
+pub fn endpoint_cache_id(mcp_url: &str) -> String {
+    let digest = Sha256::digest(mcp_url.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
     }
-}
-
-/// Перенос `default_cache_path`.
-pub fn default_cache_path() -> String {
-    default_cache_path_for(ASSIST_ENDPOINT_ID)
+    format!("hamcp-{hex}")
 }
 
 /// Путь кэша для конкретного endpoint: `~/.cache/ha-cli/tools-<id>.json`.
@@ -231,30 +214,14 @@ pub struct ToolDiscovery {
 }
 
 impl ToolDiscovery {
-    /// Контракт сохранён: `new(Some(путь))` и `new(None)` (default Assist
-    /// путь). Endpoint — прежний Assist.
-    pub fn new(cache_path: Option<String>) -> Self {
-        Self::with_ttl(cache_path, DEFAULT_CACHE_TTL)
-    }
-
-    /// Кэш для конкретного endpoint: Assist без `mcp_url`, ha-mcp — по
-    /// дайджесту полного URL. Разные серверы никогда не делят один файл.
-    pub fn for_endpoint(mcp_url: Option<&str>) -> Self {
+    /// Кэш для конкретного endpoint: по дайджесту полного URL. Разные
+    /// серверы никогда не делят один файл.
+    pub fn for_endpoint(mcp_url: &str) -> Self {
         let endpoint_id = endpoint_cache_id(mcp_url);
         Self {
             cache_path: default_cache_path_for(&endpoint_id),
             endpoint_id,
             cache_ttl: DEFAULT_CACHE_TTL,
-            mapping: None,
-            from_cache: false,
-        }
-    }
-
-    pub fn with_ttl(cache_path: Option<String>, cache_ttl: u64) -> Self {
-        Self {
-            cache_path: cache_path.unwrap_or_else(default_cache_path),
-            endpoint_id: ASSIST_ENDPOINT_ID.to_string(),
-            cache_ttl,
             mapping: None,
             from_cache: false,
         }

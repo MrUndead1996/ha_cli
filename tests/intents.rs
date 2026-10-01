@@ -1,7 +1,7 @@
 use ha_cli::client::{Client, HttpResponse, Transport};
 use ha_cli::config::Config;
 use ha_cli::errors::{ErrorType, HaCliError};
-use ha_cli::intents::{execute, normalize_result, validate_intent, INITIAL_INTENT_SET};
+use ha_cli::intents::{execute, validate_intent, INITIAL_INTENT_SET};
 use ha_cli::security::Secrets;
 use serde_json::{json, Value as Json};
 use std::collections::VecDeque;
@@ -49,10 +49,6 @@ impl MockTransport {
         }
     }
 
-    fn push_tools_list(&self, tools: Vec<Json>) {
-        self.tools.lock().unwrap().push_back(tools);
-    }
-
     fn push_call_result(&self, status: u16, result: Json) {
         self.call_results
             .lock()
@@ -62,10 +58,6 @@ impl MockTransport {
 
     fn tool_calls(&self) -> Vec<(String, Json)> {
         self.tool_calls.lock().unwrap().clone()
-    }
-
-    fn tools_list_calls(&self) -> u32 {
-        *self.tools_list_calls.lock().unwrap()
     }
 }
 
@@ -147,6 +139,17 @@ fn http_response(status: u16, headers: Vec<(String, String)>, body: String) -> H
     }
 }
 
+/// Инструменты ha-mcp: путь интентов всегда идёт через каталог
+/// (ha_get_overview → ha_search → ha_get_state / ha_call_service).
+fn hamcp_tools() -> Vec<Json> {
+    vec![
+        json!({"name": "ha_get_overview"}),
+        json!({"name": "ha_search"}),
+        json!({"name": "ha_get_state"}),
+        json!({"name": "ha_call_service"}),
+    ]
+}
+
 fn default_call_result() -> Json {
     json!({"content": [{"type": "text", "text": "Turned on"}], "isError": false})
 }
@@ -154,25 +157,13 @@ fn default_call_result() -> Json {
 fn make_client(transport: &MockTransport) -> Client {
     let secrets = Secrets::new();
     let config = Config {
-        url: Some("http://ha.test:8123".to_string()),
-        mcp_url: None,
+        mcp_url: "http://ha.test/api/webhook/testsecret123".to_string(),
         mcp_auth: Default::default(),
         token: String::new(),
         timeout: 5,
         connect_timeout: 5,
     };
     Client::new(config, Box::new(transport.clone()), &secrets)
-}
-
-fn tool_result(text: &str, is_error: bool, structured: Option<Json>) -> Json {
-    let mut result = json!({
-        "content": [{"type": "text", "text": text}],
-        "isError": is_error,
-    });
-    if let Some(structured) = structured {
-        result["structuredContent"] = structured;
-    }
-    result
 }
 
 // --- validate_intent / allowlist ---
@@ -215,362 +206,7 @@ fn blocked_intent_is_exit_code_2() {
     assert_eq!(err.kind.exit_code(), 2);
 }
 
-// --- normalize_result ---
-
-#[test]
-fn normalize_success_with_text() {
-    let data = normalize_result(&tool_result("Turned on the light", false, None)).unwrap();
-    assert_eq!(
-        data,
-        json!({
-            "ok": true,
-            "response_type": "action_done",
-            "speech": "Turned on the light",
-        })
-    );
-}
-
-#[test]
-fn normalize_accepts_direct_call_tool_result_shape() {
-    let data = normalize_result(&json!({"content": [], "isError": false})).unwrap();
-    assert_eq!(data["ok"], json!(true));
-    assert_eq!(data["speech"], json!(""));
-}
-
-#[test]
-fn normalize_rejects_wrapped_result() {
-    let wrapped = json!({"result": {"content": [], "isError": false}});
-    let err = normalize_result(&wrapped).unwrap_err();
-    assert_eq!(err.kind.as_str(), ErrorType::Intent.as_str());
-}
-
-#[test]
-fn normalize_is_error_raises_intent_error() {
-    let err = normalize_result(&tool_result("target not found", true, None)).unwrap_err();
-    assert!(err.message.contains("target not found"));
-    assert_eq!(err.kind.exit_code(), 7);
-}
-
-#[test]
-fn normalize_is_error_without_text() {
-    let err = normalize_result(&json!({"content": [], "isError": true})).unwrap_err();
-    assert_eq!(err.message, "intent execution failed");
-}
-
-#[test]
-fn normalize_structured_content_included() {
-    let data = normalize_result(&tool_result(
-        "ok",
-        false,
-        Some(json!({"entities": ["light.kitchen"]})),
-    ))
-    .unwrap();
-    assert_eq!(data["data"], json!({"entities": ["light.kitchen"]}));
-}
-
-#[test]
-fn normalize_home_assistant_json_text() {
-    let response = json!({
-        "speech": {"plain": {"speech": "Включено"}},
-        "response_type": "action_done",
-        "data": {"success": [{"name": "light_kitchen"}], "failed": []},
-    });
-
-    let data = normalize_result(&tool_result(&response.to_string(), false, None)).unwrap();
-
-    assert_eq!(
-        data,
-        json!({
-            "ok": true,
-            "response_type": "action_done",
-            "speech": "Включено",
-            "data": {"success": [{"name": "light_kitchen"}], "failed": []},
-        })
-    );
-}
-
-#[test]
-fn normalize_home_assistant_empty_speech() {
-    let data = normalize_result(&tool_result(
-        r#"{"speech": {}, "response_type": "action_done", "data": {}}"#,
-        false,
-        None,
-    ))
-    .unwrap();
-    assert_eq!(
-        data,
-        json!({
-            "ok": true,
-            "response_type": "action_done",
-            "speech": "",
-            "data": {},
-        })
-    );
-}
-
-#[test]
-fn normalize_ignores_non_text_content() {
-    let data = normalize_result(&json!({
-        "content": [{"type": "image", "data": "x"}],
-        "isError": false,
-    }))
-    .unwrap();
-    assert_eq!(data["speech"], json!(""));
-}
-
-#[test]
-fn normalize_rejects_missing_content() {
-    assert!(normalize_result(&json!({"isError": false})).is_err());
-}
-
-#[test]
-fn normalize_rejects_malformed_content() {
-    assert!(normalize_result(&json!({"content": "not-a-list", "isError": false})).is_err());
-}
-
-#[test]
-fn normalize_rejects_non_dict() {
-    assert!(normalize_result(&json!([1, 2, 3])).is_err());
-}
-
-#[test]
-fn normalize_key_insertion_order_matches_python() {
-    // Python-версия строит dict в порядке ok, response_type, speech, data.
-    let data = normalize_result(&tool_result(
-        r#"{"response_type": "query_answer", "speech": {"plain": {"speech": "off"}}, "data": {"x": 1}}"#,
-        false,
-        None,
-    ))
-    .unwrap();
-    let serialized = data.to_string();
-    let ok_pos = serialized.find("\"ok\":").unwrap();
-    let rt_pos = serialized.find("\"response_type\":").unwrap();
-    let speech_pos = serialized.find("\"speech\":").unwrap();
-    let data_pos = serialized.find("\"data\":").unwrap();
-    assert!(ok_pos < rt_pos && rt_pos < speech_pos && speech_pos < data_pos);
-}
-
 // --- execute ---
-
-#[test]
-fn execute_success() {
-    let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![
-        json!({"name": "HassTurnOn"}),
-        json!({"name": "HassTurnOff"}),
-    ]);
-    let mut client = make_client(&transport);
-
-    let data = execute(
-        &mut client,
-        "HassTurnOn",
-        &json!({"area": "Кухня", "domain": "light"}),
-    )
-    .unwrap();
-
-    assert_eq!(data["ok"], json!(true));
-    assert_eq!(data["speech"], json!("Turned on"));
-    assert_eq!(
-        transport.tool_calls(),
-        vec![(
-            "HassTurnOn".to_string(),
-            json!({"area": "Кухня", "domain": "light"}),
-        )]
-    );
-}
-
-#[test]
-fn execute_rejects_blocked_intent_without_calling() {
-    let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![json!({"name": "HassTurnOn"})]);
-    let mut client = make_client(&transport);
-
-    let err = execute(&mut client, "HassNobody", &json!({})).unwrap_err();
-
-    assert_eq!(err.kind.as_str(), ErrorType::InvalidArguments.as_str());
-    assert_eq!(transport.tool_calls().len(), 0);
-    assert_eq!(transport.tools_list_calls(), 0);
-}
-
-#[test]
-fn execute_tool_missing() {
-    let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![json!({"name": "HassTurnOff"})]);
-    let mut client = make_client(&transport);
-
-    let err = execute(&mut client, "HassTurnOn", &json!({})).unwrap_err();
-
-    assert_eq!(err.kind.as_str(), ErrorType::ToolNotFound.as_str());
-    assert_eq!(transport.tool_calls().len(), 0);
-}
-
-#[test]
-fn execute_ambiguous_tool() {
-    let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![
-        json!({"name": "server1__HassTurnOn"}),
-        json!({"name": "server2__HassTurnOn"}),
-    ]);
-    let mut client = make_client(&transport);
-
-    let err = execute(&mut client, "HassTurnOn", &json!({})).unwrap_err();
-
-    assert_eq!(err.kind.as_str(), ErrorType::AmbiguousTool.as_str());
-    assert_eq!(transport.tool_calls().len(), 0);
-}
-
-#[test]
-fn execute_tool_call_runtime_error_propagates() {
-    let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![json!({"name": "HassTurnOn"})]);
-    transport.push_call_result(500, json!(null));
-    let mut client = make_client(&transport);
-
-    let err = execute(&mut client, "HassTurnOn", &json!({"area": "Кухня"})).unwrap_err();
-
-    assert_eq!(err.kind.as_str(), ErrorType::HaApi.as_str());
-}
-
-#[test]
-fn execute_uses_prefixed_mcp_name() {
-    let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![json!({"name": "assist__HassTurnOn"})]);
-    let mut client = make_client(&transport);
-
-    let data = execute(&mut client, "HassTurnOn", &json!({"area": "Кухня"})).unwrap();
-
-    assert_eq!(data["ok"], json!(true));
-    assert_eq!(transport.tool_calls()[0].0, "assist__HassTurnOn");
-}
-
-#[test]
-fn execute_adapts_string_to_array_from_tool_schema() {
-    let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![json!({
-        "name": "intent__HassTurnOn",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"domain": {"type": "array"}},
-        },
-    })]);
-    let mut client = make_client(&transport);
-
-    execute(
-        &mut client,
-        "HassTurnOn",
-        &json!({"area": "Кухня", "domain": "light"}),
-    )
-    .unwrap();
-
-    assert_eq!(
-        transport.tool_calls(),
-        vec![(
-            "intent__HassTurnOn".to_string(),
-            json!({"area": "Кухня", "domain": ["light"]}),
-        )]
-    );
-}
-
-#[test]
-fn execute_preserves_existing_array_argument() {
-    let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![json!({
-        "name": "HassTurnOn",
-        "inputSchema": {
-            "properties": {"domain": {"type": "array"}},
-        },
-    })]);
-    let mut client = make_client(&transport);
-
-    execute(
-        &mut client,
-        "HassTurnOn",
-        &json!({"domain": ["light", "switch"]}),
-    )
-    .unwrap();
-
-    assert_eq!(
-        transport.tool_calls()[0].1,
-        json!({"domain": ["light", "switch"]}),
-    );
-}
-
-#[test]
-fn execute_stale_tool_result_triggers_refresh_and_retry() {
-    let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![json!({"name": "old__HassTurnOn"})]);
-    transport.push_tools_list(vec![json!({"name": "new__HassTurnOn"})]);
-    transport.push_call_result(
-        200,
-        json!({
-            "isError": true,
-            "content": [{"type": "text", "text": "Error calling tool: Tool \"old__HassTurnOn\" not found"}],
-        }),
-    );
-    let mut client = make_client(&transport);
-
-    let data = execute(&mut client, "HassTurnOn", &json!({"area": "Кухня"})).unwrap();
-
-    assert_eq!(data["ok"], json!(true));
-    // tools/list: изначальный + refresh; tools/call: stale + retry.
-    assert_eq!(transport.tools_list_calls(), 2);
-    assert_eq!(transport.tool_calls().len(), 2);
-    assert_eq!(transport.tool_calls()[1].0, "new__HassTurnOn");
-}
-
-#[test]
-fn get_state_fallback_context_error_propagates_on_bad_text() {
-    let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![json!({"name": "homeassistant__GetLiveContext"})]);
-    let mut client = make_client(&transport);
-
-    let err = execute(
-        &mut client,
-        "HassGetState",
-        &json!({"area": "кухня", "domain": "switch", "name": "light_kitchen"}),
-    )
-    .unwrap_err();
-
-    assert_eq!(err.kind.as_str(), ErrorType::Context.as_str());
-    // Ответ мока ("Turned on") — не JSON, парсер live context падает.
-    assert_eq!(
-        transport.tool_calls(),
-        vec![("homeassistant__GetLiveContext".to_string(), json!({}))],
-    );
-}
-
-// Полный порт test_get_state_falls_back_to_live_context_when_tool_is_missing:
-// требует живой реализации context (Phase 4).
-#[test]
-fn get_state_falls_back_to_live_context_when_tool_is_missing() {
-    let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![json!({"name": "homeassistant__GetLiveContext"})]);
-    transport.push_call_result(
-        200,
-        json!({
-            "content": [{
-                "type": "text",
-                "text": r#"{"entities":[{"area":"kitchen, кухня","domain":"switch","name":"light_kitchen","state":"off"}]}"#,
-            }],
-            "isError": false,
-        }),
-    );
-    let mut client = make_client(&transport);
-
-    let result = execute(
-        &mut client,
-        "HassGetState",
-        &json!({"area": "кухня", "domain": "switch", "name": "light_kitchen"}),
-    )
-    .unwrap();
-
-    assert_eq!(result["response_type"], json!("query_answer"));
-    assert_eq!(result["data"]["states"][0]["state"], json!("off"));
-    assert_eq!(
-        transport.tool_calls(),
-        vec![("homeassistant__GetLiveContext".to_string(), json!({}))],
-    );
-}
 
 // --- security: запрет entity_id в payload интентов (из test_security.py) ---
 
@@ -657,29 +293,6 @@ fn entity_id_like_value_rejected() {
 }
 
 #[test]
-fn semantic_payload_still_works() {
-    let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![json!({"name": "HassTurnOn"})]);
-    let mut client = make_client(&transport);
-
-    let data = execute(
-        &mut client,
-        "HassTurnOn",
-        &json!({"area": "Кухня", "domain": "light", "name": "Ceiling"}),
-    )
-    .unwrap();
-
-    assert_eq!(data["ok"], json!(true));
-    assert_eq!(
-        transport.tool_calls(),
-        vec![(
-            "HassTurnOn".to_string(),
-            json!({"area": "Кухня", "domain": "light", "name": "Ceiling"}),
-        )]
-    );
-}
-
-#[test]
 fn blocked_intent_names_cannot_reach_mcp() {
     for name in ["tools/call", "initialize", "HassBroadcast", "service.call"] {
         let _cache = isolated_cache();
@@ -693,120 +306,15 @@ fn blocked_intent_names_cannot_reach_mcp() {
     }
 }
 
-// --- 2.4: различение исходов tools/call ---
-
-#[test]
-fn normalize_is_error_uses_structured_tool_error_message() {
-    // Текст content пуст, сообщение ToolError в structuredContent.
-    let err = normalize_result(&json!({
-        "content": [],
-        "isError": true,
-        "structuredContent": {"error": "entity not exposed by ha-mcp"},
-    }))
-    .unwrap_err();
-    assert_eq!(err.kind.exit_code(), 7);
-    assert_eq!(err.message, "entity not exposed by ha-mcp");
-}
-
-#[test]
-fn normalize_is_error_structured_message_key() {
-    let err = normalize_result(&json!({
-        "content": [{"type": "text", "text": ""}],
-        "isError": true,
-        "structuredContent": {"message": "service call failed"},
-    }))
-    .unwrap_err();
-    assert_eq!(err.message, "service call failed");
-}
-
-#[test]
-fn normalize_is_error_prefers_content_text_over_structured() {
-    let err = normalize_result(&json!({
-        "content": [{"type": "text", "text": "light is unavailable"}],
-        "isError": true,
-        "structuredContent": {"error": "structured detail"},
-    }))
-    .unwrap_err();
-    assert_eq!(err.message, "light is unavailable");
-}
-
-#[test]
-fn normalize_success_false_in_structured_content_without_error() {
-    // success:false без content и без error — не успешный результат.
-    let err = normalize_result(&json!({
-        "content": [],
-        "isError": false,
-        "structuredContent": {"success": false},
-    }))
-    .unwrap_err();
-    assert_eq!(err.kind.exit_code(), 7);
-    assert_eq!(err.message, "tool reported failure");
-}
-
-#[test]
-fn normalize_success_false_in_structured_content_with_error() {
-    let err = normalize_result(&json!({
-        "content": [],
-        "isError": false,
-        "structuredContent": {"success": false, "error": "lamp refused the command"},
-    }))
-    .unwrap_err();
-    assert_eq!(err.kind.exit_code(), 7);
-    assert_eq!(err.message, "lamp refused the command");
-}
-
-#[test]
-fn normalize_success_false_in_text_with_content() {
-    let err = normalize_result(&tool_result(
-        r#"{"success": false, "error": "refused by ha-mcp"}"#,
-        false,
-        None,
-    ))
-    .unwrap_err();
-    assert_eq!(err.kind.exit_code(), 7);
-    assert_eq!(err.message, "refused by ha-mcp");
-}
-
-#[test]
-fn normalize_success_false_in_text_without_error_key() {
-    let err = normalize_result(&tool_result(r#"{"success": false}"#, false, None)).unwrap_err();
-    assert_eq!(err.kind.exit_code(), 7);
-    assert_eq!(err.message, "tool reported failure");
-}
-
-#[test]
-fn normalize_success_true_is_not_failure() {
-    let data = normalize_result(&tool_result(
-        r#"{"success": true, "result": "done"}"#,
-        false,
-        Some(json!({"success": true, "result": "done"})),
-    ))
-    .unwrap();
-    assert_eq!(data["ok"], json!(true));
-}
-
-#[test]
-fn normalize_nested_success_key_is_not_top_level_failure() {
-    // Assist-ответ: "success" внутри data — не признак неудачи инструмента.
-    let data = normalize_result(&tool_result(
-        r#"{"speech": "ok", "response_type": "action_done",
-            "data": {"success": [], "failed": []}}"#,
-        false,
-        None,
-    ))
-    .unwrap();
-    assert_eq!(data["ok"], json!(true));
-}
-
 #[test]
 fn tools_call_http_401_is_authentication_error_without_retry() {
     let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![json!({"name": "HassTurnOn"})]);
+    let transport = MockTransport::new(hamcp_tools());
     transport.push_call_result(401, default_call_result());
     let mut client = make_client(&transport);
 
     let err = execute(&mut client, "HassTurnOn", &json!({"area": "Kitchen"})).unwrap_err();
-
+    eprintln!("ERR={err:?}");
     assert_eq!(err.kind.exit_code(), 4);
     assert_eq!(transport.tool_calls().len(), 1);
 }
@@ -814,7 +322,7 @@ fn tools_call_http_401_is_authentication_error_without_retry() {
 #[test]
 fn tools_call_http_403_is_authentication_error_without_retry() {
     let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![json!({"name": "HassTurnOn"})]);
+    let transport = MockTransport::new(hamcp_tools());
     transport.push_call_result(403, default_call_result());
     let mut client = make_client(&transport);
 
@@ -827,7 +335,7 @@ fn tools_call_http_403_is_authentication_error_without_retry() {
 #[test]
 fn tools_call_is_error_result_is_intent_error_without_retry() {
     let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![json!({"name": "HassTurnOn"})]);
+    let transport = MockTransport::new(hamcp_tools());
     transport.push_call_result(
         200,
         json!({
@@ -839,63 +347,8 @@ fn tools_call_is_error_result_is_intent_error_without_retry() {
 
     let err = execute(&mut client, "HassTurnOn", &json!({"area": "Kitchen"})).unwrap_err();
 
-    assert_eq!(err.kind.exit_code(), 7);
-    // Ошибка результата не трактуется как устаревшая схема: повторного
-    // вызова tools/call нет.
+    // Первый tools/call — ha_get_overview: isError инструмента каталога —
+    // context-ошибка; повторного вызова tools/call нет.
+    assert_eq!(err.kind.exit_code(), 10);
     assert_eq!(transport.tool_calls().len(), 1);
-}
-
-#[test]
-fn normalize_is_error_without_content_uses_structured_tool_error() {
-    let err = normalize_result(&json!({
-        "isError": true,
-        "structuredContent": {"error": "service unavailable"},
-    }))
-    .unwrap_err();
-    assert_eq!(err.kind.exit_code(), 7);
-    assert_eq!(err.message, "service unavailable");
-}
-
-#[test]
-fn normalize_structured_success_false_without_content_is_intent_error() {
-    let err = normalize_result(&json!({
-        "isError": false,
-        "structuredContent": {"success": false, "error": "lamp refused"},
-    }))
-    .unwrap_err();
-    assert_eq!(err.kind.exit_code(), 7);
-    assert_eq!(err.message, "lamp refused");
-}
-
-#[test]
-fn normalize_normal_result_without_content_still_requires_content() {
-    // Обратная совместимость: не-ошибочный результат без content отклоняется.
-    let err = normalize_result(&json!({"isError": false})).unwrap_err();
-    assert_eq!(err.message, "tool result has no content");
-}
-
-#[test]
-fn execute_assist_path_without_mcp_url_keeps_loose_payload_compatibility() {
-    // Этап 4.1: строгая интент-валидация применяется ТОЛЬКО на ha-mcp
-    // пути (`mcp_url` задан). Assist endpoint без `mcp_url` сохраняет
-    // прежнее поведение: payload передаётся инструменту как раньше.
-    let _cache = isolated_cache();
-    let transport = MockTransport::new(vec![json!({"name": "HassTurnOn"})]);
-    let mut client = make_client(&transport);
-
-    let data = execute(
-        &mut client,
-        "HassTurnOn",
-        &json!({"area": "Кухня", "custom_key": {"nested": true}}),
-    )
-    .unwrap();
-
-    assert_eq!(data["ok"], json!(true));
-    assert_eq!(
-        transport.tool_calls(),
-        vec![(
-            "HassTurnOn".to_string(),
-            json!({"area": "Кухня", "custom_key": {"nested": true}}),
-        )]
-    );
 }

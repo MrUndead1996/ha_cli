@@ -282,10 +282,10 @@ fn validate_service_param(intent: &str, key: &str, value: &Json) -> Result<(), S
 }
 
 /// Строгая валидация payload действия ДО любых сетевых вызовов
-/// (docs/mcp_migration.md, этап 4.1), для ha-mcp-пути (`mcp_url` задан).
-/// Включает рекурсивный запрет `entity_id` (`validate_entity_payload`),
-/// проверку неизвестных ключей по интент-специфичному allowlist, типов
-/// и диапазонов значений, а также допустимых сочетаний параметров:
+/// (docs/mcp_migration.md, этап 4.1). Включает рекурсивный запрет
+/// `entity_id` (`validate_entity_payload`), проверку неизвестных ключей по
+/// интент-специфичному allowlist, типов и диапазонов значений, а также
+/// допустимых сочетаний параметров:
 /// - селекторы `area` / `domain` / `name` обязаны быть непустыми строками,
 ///   если присутствуют (не-строковый селектор — ошибка, а не молчаливое
 ///   игнорирование);
@@ -293,9 +293,6 @@ fn validate_service_param(intent: &str, key: &str, value: &Json) -> Result<(), S
 ///   режимы света);
 /// - `HassLightSet` требует домен `light`, `HassSetPosition` — домен `cover`,
 ///   если домен указан явно (проверка ДО сети, по селектору).
-///
-/// Assist-путь без `mcp_url` продолжает использовать только
-/// `validate_entity_payload` и не меняется.
 pub fn validate_intent_payload(intent: &str, payload: &Json) -> Result<(), String> {
     validate_entity_payload(payload)?;
     let object = payload

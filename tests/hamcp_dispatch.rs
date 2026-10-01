@@ -276,8 +276,7 @@ impl Transport for SharedMock {
 
 fn make_config(mcp_auth: McpAuth) -> Config {
     Config {
-        url: Some("http://ha.local:8123".to_string()),
-        mcp_url: Some(MCP_URL.to_string()),
+        mcp_url: MCP_URL.to_string(),
         mcp_auth,
         token: TOKEN.to_string(),
         timeout: 5,
@@ -319,13 +318,11 @@ fn dispatch_light_set_full_flow_mcp_url_sse_pagination_and_service_data() {
     assert!(!out.contains("light.a"));
 
     // URL/auth: каждый запрос ушёл на настроенный mcp_url как есть,
-    // без суффикса Assist и без адреса HA; Bearer — из ha_auth.
+    // Bearer — из ha_auth.
     let requests = transport.requests();
     assert!(!requests.is_empty());
     for request in &requests {
         assert_eq!(request.url, MCP_URL, "{}", request.method);
-        assert!(!request.url.contains("/api/mcp/assist"));
-        assert!(!request.url.contains("ha.local:8123"));
     }
     let first = requests
         .iter()

@@ -25,13 +25,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Print live Assist context
+    /// Print live context (ha-mcp)
     ///
-    /// `--raw`: без `mcp_url` — сырой результат `GetLiveContext` (Assist);
-    /// с настроенным `mcp_url` (ha-mcp) — агрегированный ответ `ha_search`
-    /// по всем страницам (`entities`, `entity_total_matches`, `partial`,
-    /// `errors`, `source`, `pages`). URL с секретом и токен в вывод и логи
-    /// не попадают: секреты редактируются перед печатью.
+    /// `--raw`: агрегированный ответ `ha_search` по всем страницам
+    /// (`entities`, `entity_total_matches`, `partial`, `errors`, `source`,
+    /// `pages`). URL с секретом и токен в вывод и логи не попадают:
+    /// секреты редактируются перед печатью.
     Context {
         #[arg(long)]
         raw: bool,
@@ -58,7 +57,7 @@ pub enum Command {
 pub fn run() -> Result<u8, std::convert::Infallible> {
     let cli = Cli::parse();
     let mut secrets = Secrets::new();
-    let config = match config::load_config(None, None, &mut secrets) {
+    let config = match config::load_config(&mut secrets) {
         Ok(config) => config,
         Err(err) => return Ok(report_error(&err, &secrets, cli.debug)),
     };
@@ -146,9 +145,9 @@ pub fn dispatch(cli: &Cli, client: &mut Client) -> Result<String, HaCliError> {
             }
         }
         Command::Tools { json, refresh } => {
-            // Кэш изолирован по endpoint: Assist и ha-mcp (и разные ha-mcp
-            // URL) не делят файл кэша; `tools --refresh` работает как раньше.
-            let mut discovery = ToolDiscovery::for_endpoint(client.config.mcp_url.as_deref());
+            // Кэш изолирован по endpoint: разные ha-mcp URL не делят файл
+            // кэша; `tools --refresh` принудительно обновляет каталог.
+            let mut discovery = ToolDiscovery::for_endpoint(&client.config.mcp_url);
             let mapping = if *refresh {
                 discovery.tools_refresh(client)?
             } else {

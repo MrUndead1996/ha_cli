@@ -84,8 +84,7 @@ fn eq_ci(a: &str, b: &str) -> bool {
 
 /// Дедупликация по внутреннему `entity_id`: повтор записи каталога — та же
 /// цель, а не вторая; она не должна ни дублировать массовый набор, ни
-/// делать точечное имя «неоднозначным». Записи без `entity_id` (Assist)
-/// не дедуплицируются.
+/// делать точечное имя «неоднозначным».
 pub fn dedupe_entities(entities: Vec<Entity>) -> Vec<Entity> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     entities
@@ -97,15 +96,13 @@ pub fn dedupe_entities(entities: Vec<Entity>) -> Vec<Entity> {
         .collect()
 }
 
-/// Сопоставление сущности селекторам. `area` сопоставляется только области
-/// и её алиасам (`Entity.aliases`, для ha-mcp пусты); алиасы СУЩНОСТИ
-/// (`entity_aliases` из `ha_search.aliases`) областью НЕ считаются и
-/// используются только как дополнительные точные имена для `name`.
+/// Сопоставление сущности селекторам. `area` сопоставляется только области;
+/// алиасы СУЩНОСТИ (`entity_aliases` из `ha_search.aliases`) областью НЕ
+/// считаются и используются только как дополнительные точные имена для
+/// `name`.
 fn matches(entity: &Entity, target: &Target) -> bool {
     if let Some(area) = &target.area {
-        let mut candidates = vec![entity.area.as_str()];
-        candidates.extend(entity.aliases.iter().map(String::as_str));
-        if !candidates.iter().any(|candidate| eq_ci(candidate, area)) {
+        if !eq_ci(&entity.area, area) {
             return false;
         }
     }
@@ -470,8 +467,7 @@ mod tests {
         // счётчик ha_search обязан остаться нулём).
         let mock = std::rc::Rc::new(MockHaMcp::default());
         let config = Config {
-            url: Some("http://ha.local".to_string()),
-            mcp_url: Some("http://ha.local/api/webhook/test".to_string()),
+            mcp_url: "http://ha.local/api/webhook/test".to_string(),
             mcp_auth: McpAuth::None,
             token: String::new(),
             timeout: 5,
@@ -581,8 +577,7 @@ mod tests {
     fn prepare_action_resolves_from_fresh_catalog_each_time() {
         let mock = std::rc::Rc::new(MockHaMcp::default());
         let config = Config {
-            url: Some("http://ha.local".to_string()),
-            mcp_url: Some("http://ha.local/api/webhook/test".to_string()),
+            mcp_url: "http://ha.local/api/webhook/test".to_string(),
             mcp_auth: McpAuth::None,
             token: String::new(),
             timeout: 5,
