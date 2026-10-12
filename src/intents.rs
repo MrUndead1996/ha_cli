@@ -210,14 +210,14 @@ fn read_live_state(result: &Json) -> Result<(String, Json), HaCliError> {
     };
     let parsed = structured
         .get("data")
-        .and_then(&read_data)
+        .and_then(read_data)
         .or_else(|| {
             structured
                 .get("states")
                 .and_then(Json::as_array)
                 .filter(|states| states.len() == 1)
                 .and_then(|states| states.first())
-                .and_then(&read_data)
+                .and_then(read_data)
         })
         .filter(|(state, _)| !state.trim().is_empty());
     let (state, attributes) = match parsed {
