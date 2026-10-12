@@ -15,14 +15,6 @@ pub struct Entity {
     /// внутри CLI после разрешения семантической цели и никогда не
     /// принимается от пользователя.
     pub entity_id: Option<String>,
-    /// Разметка агрегата из `ha_search` (`is_group`, opt-in enrichment):
-    /// `true` — групповая/агрегированная сущность с member entities, её
-    /// нельзя делать целью действия (эффект вышел бы за пределы
-    /// отфильтрованного набора листьев). Отсутствие поля (установка ha-mcp
-    /// без разметки агрегатов) считается `false`. Поле, присутствующее НЕ
-    /// булевым значением, трактуется fail-closed как `true` — нечитаемую
-    /// разметку нельзя считать гарантией листа.
-    pub is_group: bool,
 }
 
 impl Entity {
@@ -57,14 +49,6 @@ impl Entity {
             .and_then(Json::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        // `is_group`: true/false как есть; отсутствует → false (старые
-        // установки ha-mcp); присутствует не булевым значением → true
-        // (fail-closed, см. комментарий поля).
-        let is_group = match obj.get("is_group") {
-            None | Some(Json::Null) => false,
-            Some(Json::Bool(flag)) => *flag,
-            Some(_) => true,
-        };
         let entity_aliases: Vec<String> = obj
             .get("aliases")
             .and_then(Json::as_array)
@@ -92,7 +76,6 @@ impl Entity {
             capabilities,
             entity_aliases,
             entity_id,
-            is_group,
         })
     }
 }

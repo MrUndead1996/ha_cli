@@ -19,11 +19,8 @@ pub const HA_SEARCH_PAGE_LIMIT: i64 = 200;
 pub const HA_SEARCH_MAX_PAGES: usize = 1000;
 /// Поля, которые запрашиваются у `ha_search` через `result_fields`:
 /// без них ответ не содержит `area` и `aliases`, нужные модели `Entity`;
-/// `is_group` — opt-in разметка агрегатов (групп с member entities):
-/// действия обязаны видеть её, чтобы не расширить эффект за пределы
-/// отфильтрованного набора листьев (этап 4.2). Если установка/версия
-/// ha-mcp не размечает агрегаты, поле просто отсутствует — см.
-/// `Entity.is_group` про обработку отсутствия.
+/// `is_group` — разметка агрегатов для исходного вывода `context --raw`;
+/// она не ограничивает выполнение действий.
 pub const HA_SEARCH_RESULT_FIELDS: &[&str] = &[
     "entity_id",
     "friendly_name",

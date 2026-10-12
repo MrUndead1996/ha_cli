@@ -254,11 +254,8 @@ fn execute_hamcp_action(
     // сервиса. Для `HassLightSet` / `HassSetPosition` домен обязан быть
     // `light` / `cover` даже если селектор `domain` в payload отсутствовал
     // (массовый выбор по area не должен затронуть чужой домен).
-    // Агрегаты блокируются ДО первого вызова: сущность, помеченная
-    // ha_search `is_group=true` (или с нечитаемым флагом), а также домен
-    // `group` в любой цели действия отклоняются явно — фильтрация групп
-    // никогда не выполняется молча. Read-only `HassGetState` и `context`
-    // эту проверку не применяют (старая семантика сохранена).
+    // Группы поддерживаемых доменов получают тот же сервис, что и
+    // отдельные сущности; состав группы обрабатывает Home Assistant.
     for entity in &entities {
         check_action_entity(intent, entity)?;
     }
@@ -348,12 +345,8 @@ fn action_error(performed: usize, total: usize, reason: &str, entities: &[Entity
     HaCliError::new(ErrorType::Intent, scrub_internal_ids(&message, entities))
 }
 
-/// Проверка одной цели действия до первого вызова сервиса: явные
-/// агрегаты (`ha_search.is_group=true` или нечитаемый флаг) и домен
-/// `group` отклоняются с ошибкой — группа никогда не отфильтровывается
-/// молча и не получает сервисный вызов, эффект действия обязан остаться
-/// в пределах отфильтрованного набора листьев. Далее — домен по интенту
-/// (`check_action_domain`).
+/// Проверка домена цели до первого вызова сервиса. Разметка `is_group`
+/// не ограничивает действия над группами поддерживаемых доменов.
 fn check_action_entity(intent: &str, entity: &Entity) -> Result<(), HaCliError> {
     if entity.domain.eq_ignore_ascii_case("group") {
         return Err(HaCliError::new(
@@ -361,17 +354,6 @@ fn check_action_entity(intent: &str, entity: &Entity) -> Result<(), HaCliError> 
             format!(
                 "domain 'group' is not a valid action target ('{}' is an \
                  aggregate); no service was called",
-                entity.name
-            ),
-        ));
-    }
-    if entity.is_group {
-        return Err(HaCliError::new(
-            ErrorType::Intent,
-            format!(
-                "'{}' is a group or aggregate entity (or has an unreadable \
-                 is_group flag); actions target leaf entities only, so no \
-                 service was called",
                 entity.name
             ),
         ));
@@ -1079,7 +1061,7 @@ mod tests {
                 let mut aggregate = entity_raw("group.all_lights", "Kitchen", "All Lights");
                 aggregate["is_group"] = json!(true);
                 all.push(aggregate);
-                // Нечитаемый флаг: не булево значение — fail-closed.
+                // Нечитаемый флаг не влияет на разрешение действий.
                 let mut unreadable = entity_raw("light.flag_odd", "Kitchen", "Odd Flag");
                 unreadable["is_group"] = json!("yes");
                 all.push(unreadable);
@@ -1598,34 +1580,41 @@ mod tests {
     }
 
     #[test]
-    fn named_group_target_is_rejected_before_any_service_call() {
-        // Группа, помеченная ha_search is_group=true, не может быть целью
-        // действия: ошибка вместо молчаливой фильтрации, 0 вызовов.
+    fn named_group_target_calls_service() {
         let mock = std::rc::Rc::new(MockAction::with_groups());
         let mut client = action_client(&mock);
-        let err = execute(&mut client, "HassTurnOn", &json!({"name": "Group Lights"})).unwrap_err();
-        assert!(matches!(err.kind, ErrorType::Intent), "{err}");
-        assert!(err.message.contains("group or aggregate"), "{err}");
-        // Внутренний ID не раскрывается.
-        assert!(!err.message.contains("light.group_kitchen"));
-        assert_eq!(mock.call_count(), 0);
+        let result = execute(&mut client, "HassTurnOn", &json!({"name": "Group Lights"})).unwrap();
+        assert_eq!(result["response_type"], json!("action_done"));
+        assert!(!result.to_string().contains("light.group_kitchen"));
+        assert_eq!(mock.call_count(), 1);
+        assert_eq!(mock.calls()[0]["entity_id"], json!("light.group_kitchen"));
+        assert_eq!(mock.calls()[0]["service"], json!("turn_on"));
     }
 
     #[test]
-    fn mixed_bulk_containing_group_is_rejected_before_any_service_call() {
-        // Bulk по area+domain, где среди совпавших есть группа: набор не
-        // урезается молча — действие отменяется целиком, 0 вызовов.
+    fn light_set_bulk_includes_groups() {
         let mock = std::rc::Rc::new(MockAction::with_groups());
         let mut client = action_client(&mock);
-        let err = execute(
+        let result = execute(
             &mut client,
-            "HassTurnOn",
-            &json!({"area": "Kitchen", "domain": "light"}),
+            "HassLightSet",
+            &json!({"area": "Kitchen", "domain": "light", "brightness": 40}),
         )
-        .unwrap_err();
-        assert!(matches!(err.kind, ErrorType::Intent), "{err}");
-        assert!(err.message.contains("Group Lights"), "{err}");
-        assert_eq!(mock.call_count(), 0);
+        .unwrap();
+        assert_eq!(result["response_type"], json!("action_done"));
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 4);
+        for (call, id) in calls.iter().zip([
+            "light.a",
+            "light.b",
+            "light.group_kitchen",
+            "light.flag_odd",
+        ]) {
+            assert_eq!(call["entity_id"], json!(id));
+            assert_eq!(call["domain"], json!("light"));
+            assert_eq!(call["service"], json!("turn_on"));
+            assert_eq!(call["data"]["brightness_pct"], json!(40));
+        }
     }
 
     #[test]
@@ -1639,15 +1628,14 @@ mod tests {
     }
 
     #[test]
-    fn non_boolean_group_flag_is_fail_closed() {
-        // is_group не булево значение: нельзя считать гарантией листа —
-        // цель отклоняется до вызова сервиса.
+    fn non_boolean_group_flag_does_not_block_action() {
         let mock = std::rc::Rc::new(MockAction::with_groups());
         let mut client = action_client(&mock);
-        let err = execute(&mut client, "HassTurnOn", &json!({"name": "Odd Flag"})).unwrap_err();
-        assert!(matches!(err.kind, ErrorType::Intent), "{err}");
-        assert!(err.message.contains("group or aggregate"), "{err}");
-        assert_eq!(mock.call_count(), 0);
+        let result = execute(&mut client, "HassTurnOff", &json!({"name": "Odd Flag"})).unwrap();
+        assert_eq!(result["response_type"], json!("action_done"));
+        assert_eq!(mock.call_count(), 1);
+        assert_eq!(mock.calls()[0]["entity_id"], json!("light.flag_odd"));
+        assert_eq!(mock.calls()[0]["service"], json!("turn_off"));
     }
 
     #[test]
@@ -1660,8 +1648,7 @@ mod tests {
         assert_eq!(result["response_type"], json!("action_done"));
         assert_eq!(mock.call_count(), 1);
         assert_eq!(mock.calls()[0]["entity_id"], json!("light.a"));
-        // Read-only HassGetState сохраняет прежнюю семантику: группу можно
-        // прочитать, блокировка действует только на действия.
+        // Read-only HassGetState сохраняет прежнюю семантику.
         let mock = std::rc::Rc::new(MockGetState::new(state_payload("on")));
         let mut client = get_state_client(&mock);
         let result = execute(&mut client, "HassGetState", &json!({"name": "One"})).unwrap();
